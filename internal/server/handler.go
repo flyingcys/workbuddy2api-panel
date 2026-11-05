@@ -608,6 +608,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			"model is hidden by gateway configuration, try another model", "")
 		st.status = http.StatusBadRequest
 		st.outcome = reqlog.OutcomeHTTPError
+		st.noAccountReason = "模型被网关黑名单隐藏（models.hidden），未参与选号"
 		return
 	}
 
@@ -1296,9 +1297,57 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		status = http.StatusBadRequest
 	}
+	// 没选到号：把「为什么」写进日志事件，面板账号列才能给出可读占位而不是 "-"。
+	// 放在这里是因为 modelBlock 的最终判定就在上面（它可能覆盖 code/status），
+	// 早写会拿到还没定稿的成因。
+	if st.uid == "" {
+		st.noAccountReason = noAccountReasonText(code, modelBlock, lastErr)
+	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
+}
+
+// noAccountReasonText 把「这次为什么没选到号」压成一句给面板看的话。
+//
+// 只在 uid 为空时调用。分类与末端出口的 code 一一对应，但**不复用 code 字面量**：
+// code 是给客户端 SDK 判重试语义的（no_healthy_account / model_unavailable），
+// 面板要的是给人读的成因与时间。
+//
+// 之所以值得单独做：模型级阻塞时全池号都在冷却，日志里只剩 Account="-"，
+// 运维看不出「是号挂了、还是这个模型被锁了、还是都在等上游重置」——而这三种
+// 情况的处置完全不同（等 / 换模型 / 提前唤醒）。时间与数量都是现成的，不写就浪费。
+func noAccountReasonText(code string, mb pool.ModelBlockStatus, lastErr error) string {
+	if mb.Blocked {
+		s := fmt.Sprintf("模型级限流：%d 个号冷却中", mb.Count)
+		if !mb.Until.IsZero() {
+			s += "，最早 " + mb.Until.Format("01-02 15:04") + " 解封"
+		}
+		if r := strings.TrimSpace(mb.Reason); r != "" {
+			s += "（上游：" + r + "）"
+		}
+		return s
+	}
+	switch code {
+	case "upstream_timeout":
+		return "上游超时，轮转已止损（换号会撞同一个慢上游）"
+	case "model_unavailable":
+		return "该模型在网关侧不可用，未选到号"
+	case "waf_ip_blocked":
+		return "网关出口 IP 被上游 WAF 拦截，轮转已止损"
+	case "upstream_busy":
+		return "上游容量已满（queue.full）"
+	case "rate_limit_exceeded":
+		return "全部账号限流冷却中"
+	}
+	// 默认 no_healthy_account：号都在，但此刻不可选（账号级冷却/在途占满/积分保底）。
+	// lastErr 通常为空——负缓存写入后这里已无上游原文，所以只能给定性描述。
+	if lastErr != nil {
+		if msg := strings.TrimSpace(lastErr.Error()); msg != "" {
+			return "无可用账号：" + logfmt.Truncate(msg, 120)
+		}
+	}
+	return "无可用账号（账号级冷却 / 在途占满 / 积分保底）"
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。

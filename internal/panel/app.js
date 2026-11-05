@@ -994,7 +994,11 @@ function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+    // no_account_reason 也进关键字池：运维更常搜的是「限流」「无可用账号」这类成因，
+    // 而不是某个具体的 uid。它不进账号**筛选**（后端 Filter.Account 只看 account），
+    // 所以不会出现「按账号查却命中没选号请求」的误命中。
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account,
+      e && e.no_account_reason, e && e.request_id]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
@@ -1024,6 +1028,19 @@ function reqCreditCell(e) {
   return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
 }
 
+/* reqAccountCell 账号列。没选到号的请求没有账号，但「为什么没有」是可得的
+   （后端 Event.no_account_reason）：直接显示成因，而不是一个无信息量的破折号。
+   成因放在 title 里给完整文本，单元格只留「未选号」+ 精简摘要，避免撑爆列宽。 */
+function reqAccountCell(e) {
+  const account = e && e.account;
+  if (account) return esc(account);
+  const reason = e && e.no_account_reason ? String(e.no_account_reason) : '';
+  if (!reason) return '<span class="muted">—</span>';
+  // 摘要取第一个分隔符之前的部分（"模型级限流：5 个号冷却中，最早 …" → "模型级限流"）。
+  const brief = reason.split(/[：，,(（]/)[0].slice(0, 12);
+  return '<span class="muted" title="' + esc(reason) + '">' + esc(brief) + '</span>';
+}
+
 /* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
    UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
 function renderRequestTable() {
@@ -1039,7 +1056,7 @@ function renderRequestTable() {
       '<td class="num">' + esc(when) + '</td>' +
       '<td>' + reqOutcomeTag(e) + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
-      '<td>' + esc(e && e.account || '—') + '</td>' +
+      '<td>' + reqAccountCell(e) + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td class="num">' + fmtMs(e && e.duration_ms) + '</td>' +
@@ -1094,7 +1111,7 @@ function requestLogText(e) {
     when,
     String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
     e && e.model || '—',
-    e && e.account || '—',
+    (e && e.account) || (e && e.no_account_reason ? '未选号：' + e.no_account_reason : '—'),
     e && e.client_ip || '—',
     e && e.user_agent || '—',
     fmtMs(e && e.duration_ms),

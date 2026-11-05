@@ -277,6 +277,76 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// 没选到号的请求：运行日志账号列必须给出成因，不能是一个无信息量的破折号。
+//
+// 现场形态：hy4free 触发 6004 后 5 个号全在冷却，选号返回 nil，后端此前把
+// Event.Account 写成 logfmt.Label("","") == "-"，前端原样渲染成 "-"。
+func TestAppJSRequestLogNoAccountReason(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; no-account reason test skipped")
+	}
+	script := `'use strict';
+const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+function slice(from, to) {
+  const a = src.indexOf(from), b = src.indexOf(to);
+  if (a < 0 || b < 0) throw new Error('missing ' + from);
+  return src.slice(a, b);
+}
+const ctx = { Date, Number, String, Math, RegExp, isNaN };
+vm.createContext(ctx);
+vm.runInContext(
+  slice('function esc(', 'function ago(') +
+  slice('function reqAccountCell(', 'function renderRequestTable(') +
+  '\nthis.reqAccountCell=reqAccountCell;',
+  ctx
+);
+const limited = { account: '', no_account_reason: '模型级限流：5 个号冷却中，最早 11-05 15:20 解封' };
+const failed = { account: '', no_account_reason: '无可用账号（账号级冷却 / 在途占满 / 积分保底）' };
+const normal = { account: '账号(uid8)' };
+const bare = { account: '' };
+process.stdout.write(JSON.stringify({
+  limited: ctx.reqAccountCell(limited),
+  failed: ctx.reqAccountCell(failed),
+  normal: ctx.reqAccountCell(normal),
+  bare: ctx.reqAccountCell(bare),
+  unknown: ctx.reqAccountCell({}),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "no-account-reason-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("no-account reason node test failed: %v\n%s", err, out)
+	}
+	got := string(out)
+	// 账号在时原样输出，不套 span。
+	if !strings.Contains(got, `"normal":"账号(uid8)"`) {
+		t.Errorf("account cell must render the account verbatim: %s", got)
+	}
+	// 没选到号时必须给出成因摘要，而不是破折号。
+	if !strings.Contains(got, "模型级限流") {
+		t.Errorf("limited row must surface reason summary: %s", got)
+	}
+	if strings.Contains(got, `"limited":"<span class=\"muted\">—</span>"`) {
+		t.Errorf("limited row must not fall back to em dash: %s", got)
+	}
+	// 既无账号又无原因（老归档条目）才退回占位。
+	if !strings.Contains(got, `"bare":"<span class=\"muted\">—</span>"`) {
+		t.Errorf("bare row without reason must fall back to em dash: %s", got)
+	}
+	if !strings.Contains(got, `"unknown":"<span class=\"muted\">—</span>"`) {
+		t.Errorf("missing event must fall back to em dash: %s", got)
+	}
+}
+
 // 积分历史区块：变动列 +N / −N（U+2212）、余额千分位、空列表提示。
 func TestAppJSCreditHistoryFormatting(t *testing.T) {
 	node, err := exec.LookPath("node")

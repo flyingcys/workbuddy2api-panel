@@ -66,6 +66,14 @@ type Event struct {
 	RequestID        string    `json:"request_id"`
 	Path             string    `json:"path"`
 	Account          string    `json:"account,omitempty"`
+	// NoAccountReason 本次请求**没选到账号**时的原因摘要（如「模型级限流：5 个号
+	// 冷却中，最早 15:20 解封」）。与 Account 互斥：选到号时留空。
+	//
+	// 为什么需要独立字段而不是塞进 Account：Account 参与 Filter 的子串匹配
+	// （reqlog.go Filter.match）与前端关键字检索，混入非账号文本会让「按账号查」
+	// 命中一堆没选到号的请求。此前该场景 Account 被写成字面量 "-"（来自
+	// logfmt.UID8("")），面板只剩一个 '-'，既看不出原因、又会被 "−" 关键字误命中。
+	NoAccountReason  string    `json:"no_account_reason,omitempty"`
 	Model            string    `json:"model,omitempty"`
 	Status           int       `json:"status"`
 	OK               bool      `json:"ok"`

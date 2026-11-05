@@ -235,6 +235,36 @@ func TestCaptureClientInfoTruncatesUserAgent(t *testing.T) {
 	}
 }
 
+// 没选到号的 chat 请求：Event.Account 必须留空（不能写成假账号 "-"），
+// 原因落进 NoAccountReason。
+//
+// 为什么 Account 不能是 "-"：它参与面板 Filter 的子串匹配与前端关键字检索，
+// 写进一个非账号文本会让「按账号查」命中一堆无关请求；而 "-" 本身又什么信息
+// 都不给（现场：hy4free 全池 6004 冷却时，日志只剩一个破折号）。
+func TestEventNoAccountLeavesAccountEmpty(t *testing.T) {
+	tr := &requestTrace{id: "req-1", start: time.Now()}
+	tr.stat = &chatStat{uid: "", nick: "", noAccountReason: "模型级限流：5 个号冷却中"}
+
+	e := tr.event(http.StatusBadRequest)
+	if e.Account != "" {
+		t.Errorf("no-account event Account = %q, want empty", e.Account)
+	}
+	if e.NoAccountReason == "" {
+		t.Error("no-account event must carry NoAccountReason")
+	}
+
+	// 选到号时照常写账号标签，且不写原因。
+	tr2 := &requestTrace{id: "req-2", start: time.Now()}
+	tr2.stat = &chatStat{uid: "049a4ed4-da5b-47f4", nick: ""}
+	e2 := tr2.event(http.StatusOK)
+	if e2.Account != "049a4ed4" {
+		t.Errorf("account event Account = %q, want 049a4ed4", e2.Account)
+	}
+	if e2.NoAccountReason != "" {
+		t.Errorf("account event must not carry reason, got %q", e2.NoAccountReason)
+	}
+}
+
 func TestRequestMetricsDetectsStreamErrorFrame(t *testing.T) {
 	const sseErr = "data: {\"error\":{\"message\":\"upstream failed\"}}\n\ndata: [DONE]\n\n"
 	up := newFakeUpstream(t, func(string) (int, string, bool) {
@@ -327,7 +357,7 @@ func TestLogChatRowExtendedFields(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
 		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
-			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 2, 1.25, true, "", "")
+			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 2, 1.25, true, "", "", "")
 	})
 	for _, want := range []string{"rid=req-abc123", "out=success", "try=2", "credit=1.2500"} {
 		if !strings.Contains(out, want) {
@@ -346,7 +376,7 @@ func TestLogChatRowSourceFields(t *testing.T) {
 	out := captureStdout(t, func() {
 		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
 			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 1, 0, false,
-			"203.0.113.7", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+			"203.0.113.7", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "")
 	})
 	for _, want := range []string{`src=203.0.113.7`, `ua="Chrome/120.0.0.0"`} {
 		if !strings.Contains(out, want) {
@@ -367,6 +397,28 @@ func TestLogChatRowSourcePartial(t *testing.T) {
 	})
 	if strings.Contains(out, "src=") {
 		t.Errorf("logChatRow has no source, want no src field:\n%s", out)
+	}
+}
+
+// 没选到号的请求（模型级限流导致全池冷却）：账号列必须显示成因，而不是 "-"。
+//
+// 现场形态：hy4free 触发 6004 后 5 个号全在冷却，选号返回 nil，面板/流水行的
+// 账号列只剩一个破折号，运维看不出「是号挂了还是这个模型被锁了」。
+func TestLogChatRowNoAccountShowsReason(t *testing.T) {
+	withChatLog(t)
+	reason := "模型级限流：5 个号冷却中，最早 11-05 15:20 解封"
+	out := captureStdout(t, func() {
+		logChatRowEx(0, time.Second, "cn:hy4free", "stream", "", "", http.StatusBadRequest, -1,
+			"req-x", reqlog.OutcomeHTTPError, 0, 0, false, "", "", reason)
+	})
+	if strings.Contains(out, "| -                      |") {
+		t.Errorf("no-account row must not render bare dash in account column:\n%s", out)
+	}
+	if !strings.Contains(out, "无号:") {
+		t.Errorf("no-account row must show reason label:\n%s", out)
+	}
+	if !strings.Contains(out, "模型级限流") {
+		t.Errorf("reason text missing from row:\n%s", out)
 	}
 }
 

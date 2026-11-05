@@ -71,6 +71,10 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// noAccountReason 没选到账号时的原因摘要（仅 uid 为空时有意义）。
+	// 由 handler 在选号失败出口填充，落进 reqlog.Event.NoAccountReason。
+	noAccountReason string
+
 	logged bool
 }
 
@@ -90,7 +94,8 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent,
+		s.noAccountReason)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -464,7 +469,15 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	}
 	if t.stat != nil {
 		s := t.stat
-		e.Account = logfmt.Label(s.uid, s.nick)
+		// uid 为空 = 本次请求没选到号（模型级阻塞 / 无可用号 / 选号前就返回）。
+		// 此时**不要**写 logfmt.Label("","")——那会得到字面量 "-"，被面板当成一个
+		// 真实账号名渲染，还会被账号筛选与关键字检索当作命中。改为留空（前端据此
+		// 显示占位）并把原因写进 NoAccountReason，让「为什么没号」可读。
+		if s.uid != "" {
+			e.Account = logfmt.Label(s.uid, s.nick)
+		} else if r := strings.TrimSpace(s.noAccountReason); r != "" {
+			e.NoAccountReason = r
+		}
 		// chat 路径以 stat 的模型为准（覆盖 trace.model）。
 		e.Model = s.model
 		e.Outcome = s.outcome
@@ -542,21 +555,27 @@ const (
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
 func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
-	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
+	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "", "")
 }
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
-	clientIP, userAgent string) {
+	clientIP, userAgent, noAccountReason string) {
 	if !chatLogEnabled {
 		return
 	}
 	seq := chatSeq.Add(1)
 	model = logfmt.Pad(logfmt.Truncate(model, chatModelWidth), chatModelWidth)
 	// 账号标签只补不截：超宽时宁可让该行变宽，也不丢昵称信息（昵称是排查的主线索）。
-	acct := logfmt.Pad(logfmt.Label(uid, nick), chatAcctWidth)
+	// 没选到号（uid 为空）时 Label 会给出无意义的 "-"：改为显示成因摘要，否则这一行
+	// 在 docker logs 里只剩一个破折号，看不出是号挂了还是这个模型被锁了。
+	label := logfmt.Label(uid, nick)
+	if uid == "" && noAccountReason != "" {
+		label = "无号:" + logfmt.Truncate(noAccountReason, 48)
+	}
+	acct := logfmt.Pad(label, chatAcctWidth)
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {
