@@ -47,7 +47,9 @@ var exemptFuncs = map[string]string{
 var dispatchFuncs = map[string]bool{
 	"clientFor":                 true,
 	"classifyRouteTransportErr": true,
-	"chatHTTPFor":               true,
+	// 注：曾误加过 chatHTTPFor —— 那个函数在仓库里**不存在**，是凭记忆敲的。
+	// 幽灵条目无害但说明这个集合是手写的、没和源码对齐；下面的
+	// TestGateExemptFuncsAreReal 会把这类错误变成测试失败。
 }
 
 // TestGateNoUnroutedOutbound 扫描源码：出站 Do 必须经账号分派。
@@ -172,30 +174,80 @@ func firstHTTPDoExpr(body *ast.BlockStmt) string {
 	return found
 }
 
-// bodyDispatches 函数体内是否调用了账号分派函数（用于函数级豁免）。
+// bodyDispatches 判断函数体内的 Do 是否真的经账号分派。
+//
+// **不是**「函数里出现过 clientFor 就放行整函数」——那样一来，任何既有函数只要
+// 前半段调过 clientFor，后半段新加的裸 c.HTTP.Do 就完全不可见（实测 v1 判据
+// 对该形态全绿）。这正是最该防的场景：有人在既有函数里顺手加一条出站。
+//
+// 现在的判据：Do 的接收者必须是**本函数内由分派函数赋值得到的局部变量**
+// （如 client, err := c.clientFor(...)）。裸 c.HTTP / c.ChatHTTP 一律不算，
+// 除非该函数在 exemptFuncs 里显式豁免。
 func bodyDispatches(body *ast.BlockStmt) bool {
-	ok := false
+	// 收集：本函数内由分派函数赋值得到的局部变量名
+	dispatched := map[string]bool{}
 	ast.Inspect(body, func(n ast.Node) bool {
-		if ok {
-			return false
-		}
-		call, isCall := n.(*ast.CallExpr)
-		if !isCall {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok {
 			return true
 		}
-		switch fn := call.Fun.(type) {
-		case *ast.SelectorExpr:
-			if dispatchFuncs[fn.Sel.Name] {
-				ok = true
-			}
-		case *ast.Ident:
-			if dispatchFuncs[fn.Name] {
-				ok = true
+		if !rhsCallsDispatch(as.Rhs) {
+			return true
+		}
+		for _, l := range as.Lhs {
+			if id, ok := l.(*ast.Ident); ok && id.Name != "_" {
+				dispatched[id.Name] = true
 			}
 		}
 		return true
 	})
+	if len(dispatched) == 0 {
+		return false
+	}
+	// 每个 HTTP Do 的接收者都必须在 dispatched 里
+	ok := true
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, isCall := n.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		sel, isSel := call.Fun.(*ast.SelectorExpr)
+		if !isSel || sel.Sel.Name != "Do" || len(call.Args) != 1 {
+			return true
+		}
+		recv := exprString(sel.X)
+		if !isHTTPClientReceiver(recv) {
+			return true
+		}
+		// 形如 x.Do(...) 且 x 是分派得到的局部变量 → 放行
+		if id, isId := sel.X.(*ast.Ident); isId && dispatched[id.Name] {
+			return true
+		}
+		ok = false
+		return false
+	})
 	return ok
+}
+
+// rhsCallsDispatch 赋值右侧是否调用了分派函数。
+func rhsCallsDispatch(rhs []ast.Expr) bool {
+	for _, e := range rhs {
+		call, ok := e.(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		switch fn := call.Fun.(type) {
+		case *ast.SelectorExpr:
+			if dispatchFuncs[fn.Sel.Name] {
+				return true
+			}
+		case *ast.Ident:
+			if dispatchFuncs[fn.Name] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // isHTTPClientReceiver 判断 Do 的接收者是否可能是 *http.Client。
@@ -239,4 +291,58 @@ func itoaTest(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// TestGateExemptFuncsAreReal 豁免表本身必须可信。
+//
+// 三条断言，对应三种「把门禁悄悄放水」的方式：
+//  1. 键必须形如 `file:func` —— 挡住有人写成文件级（`client.go`）这种宽泛豁免，
+//     那等于整个文件不设防（v1 就栽在这里）。
+//  2. 被豁免的函数必须在源码里真实存在 —— 挡住幽灵条目（`chatHTTPFor` 就这么来过）。
+//  3. 理由必须非空 —— 强制解释，review 时看得见。
+//
+// 另外限制总数：豁免是「必须解释的例外」，不是可以随手加的开关。超了就得先
+// 想想是不是该改设计。
+func TestGateExemptFuncsAreReal(t *testing.T) {
+	const maxExempt = 3
+	if len(exemptFuncs) > maxExempt {
+		t.Fatalf("豁免条目 %d 个，超过上限 %d —— 每加一条都意味着又多了一处不受门禁管辖的出站",
+			len(exemptFuncs), maxExempt)
+	}
+
+	// 收集源码里实际存在的函数名
+	real := map[string]bool{}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, filepath.Join(".", name), nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range f.Decls {
+			if fn, ok := d.(*ast.FuncDecl); ok {
+				real[name+":"+fn.Name.Name] = true
+			}
+		}
+	}
+
+	for key, reason := range exemptFuncs {
+		if !strings.Contains(key, ":") || strings.HasSuffix(key, ".go") {
+			t.Errorf("豁免键 %q 不是 `file:func` 形式（文件级豁免等于整个文件不设防）", key)
+			continue
+		}
+		if !real[key] {
+			t.Errorf("豁免键 %q 指向的函数在源码中不存在（幽灵条目）", key)
+		}
+		if strings.TrimSpace(reason) == "" {
+			t.Errorf("豁免键 %q 没有填写理由", key)
+		}
+	}
 }

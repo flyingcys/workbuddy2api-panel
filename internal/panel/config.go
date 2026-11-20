@@ -65,6 +65,10 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 //
 // 做法是走 JSON 中转再改一段：Config 的具体类型由 main 注入（any），
 // 这里不能直接断言字段。
+//
+// ⚠️ 维护约束：脱敏是**按段做的**，不自动覆盖新增字段。将来往 Config 里加任何
+// 敏感字段（token、密码、私钥），必须同时在这里补一段 —— 否则它会以明文
+// 出现在 GET /panel/api/config 的响应里，而那个接口登录用户都能读。
 func redactConfigProxies(cfg any) any {
 	raw, err := json.Marshal(cfg)
 	if err != nil {

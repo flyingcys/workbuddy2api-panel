@@ -135,6 +135,21 @@ func applyRoutes(clean map[string]string) {
 	}
 }
 
+// RouteTableSnapshot 当前线路表的副本（供「换了表但后续步骤失败要回滚」的场景）。
+//
+// 典型用法见 cmd/server 的 saveConfig：线路表必须在落盘之前校验（否则坏配置会
+// 先写进文件），校验通过后立刻换表；若随后落盘失败，用这份快照换回去，避免
+// 「本次运行生效、重启后还原」。
+func RouteTableSnapshot() map[string]string {
+	routes.mu.RLock()
+	defer routes.mu.RUnlock()
+	out := make(map[string]string, len(routes.table))
+	for k, v := range routes.table {
+		out[k] = v
+	}
+	return out
+}
+
 // RouteVersion 当前线路表版本（测试用：断言换表确实推进了版本）。
 func RouteVersion() uint64 {
 	routes.mu.RLock()

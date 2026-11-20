@@ -523,6 +523,19 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		return nil, err
 	}
 
+	// 2.5) 线路表校验**必须在落盘之前**。
+	//
+	// 早先它在步骤 4（热应用），于是「配置页提交了坏线路」会先把文件写进去、
+	// 再报"保存被拒" —— 用户以为没保存成功，文件却已经被改了；下次启动
+	// ConfigureRoutes 整表拒绝，正常线路一起失效。这与面板路径（N2）同一个坑，
+	// 修法也一样：先试，通过才写。
+	if err := upstream.ConfigureRoutes(newCfg.Proxies); err != nil {
+		return append(restartRequiredFields(newCfg), "$proxies_rejected"),
+			fmt.Errorf("保存被拒（配置未改动）：出口线路表有无效条目：%w", err)
+	}
+	// 校验通过：换表生效。此时还没落盘 —— 下面的落盘若失败，要把表退回去。
+	oldProxies := upstream.RouteTableSnapshot()
+
 	// 3) 落盘（原子替换）。
 	out, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
@@ -530,6 +543,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		rollbackRoutes(oldProxies)
 		return nil, fmt.Errorf("write config: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -538,11 +552,13 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		// atomic path for regular files, but update the mounted file in place
 		// for this specific deployment shape.
 		if !errors.Is(err, syscall.EBUSY) {
+			rollbackRoutes(oldProxies)
 			return nil, fmt.Errorf("replace config: %w", err)
 		}
 		f, openErr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
 		if openErr != nil {
 			_ = os.Remove(tmp)
+			rollbackRoutes(oldProxies)
 			return nil, fmt.Errorf("replace config (bind mount fallback): %w", openErr)
 		}
 		_, writeErr := f.Write(out)
@@ -553,23 +569,18 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		// 写失败时保留 tmp（挂载文件已被 O_TRUNC 破坏，tmp 里是完整新内容，
 		// 可手工恢复）；写成功才清理。
 		if writeErr != nil {
+			rollbackRoutes(oldProxies)
 			return nil, fmt.Errorf("replace config (bind mount fallback, 完整新内容保留在 %s): %w", tmp, writeErr)
 		}
 		_ = os.Remove(tmp)
 		if closeErr != nil {
+			rollbackRoutes(oldProxies)
 			return nil, fmt.Errorf("replace config (bind mount fallback): %w", closeErr)
 		}
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	//
-	// 线路表先校验：它是**唯一会拒绝整次保存**的段（要么全生效、要么全不生效）。
-	// 放在 live.Store 之前，才是真正的「整次保存失败」——否则会出现
-	// 「api_key 等字段已生效、线路表没生效」的半成品状态。
-	if err := upstream.ConfigureRoutes(newCfg.Proxies); err != nil {
-		return append(restartRequiredFields(newCfg), "$proxies_rejected"),
-			fmt.Errorf("保存被拒（配置未改动）：出口线路表有无效条目：%w", err)
-	}
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
@@ -611,6 +622,18 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	}
 
 	return restartRequiredFields(newCfg), nil
+}
+
+// rollbackRoutes 把线路表退回快照，并清掉按线路缓存的 client。
+//
+// 只在「线路表已换、但后续步骤失败」时调用。失败本身不掩盖：调用方随后会返回
+// 原始错误，这里只负责让内存状态与磁盘一致。
+func rollbackRoutes(snapshot map[string]string) {
+	if err := upstream.ConfigureRoutes(snapshot); err != nil {
+		log.Printf("WARN: 线路表回滚失败（内存与磁盘可能不一致）：%v", err)
+		return
+	}
+	log.Printf("线路表已回滚（保存失败，磁盘未改动）")
 }
 
 // applyCNChatBase 把 config cn.chat_base 装配进上游 client；空则保留内置默认，
