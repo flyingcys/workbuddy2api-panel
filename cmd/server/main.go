@@ -202,17 +202,16 @@ func main() {
 		return tr
 	})
 	if err := upstream.ConfigureRoutes(cfg.Proxies); err != nil {
-		// 地址非法不阻断启动：线路表其余条目仍可用，绑到坏线路的账号会在
-		// 发请求时明确报错（不静默直连）。这里必须让人看见。
-		log.Printf("WARN: 出口线路表有问题：%v", err)
+		// 语义是「全不生效」：有一条非法就整表不应用，绑了线路的账号会明确报
+		// 「线路不存在」而不是从一条**部分生效**的表里静默挑到别的出口。
+		log.Printf("WARN: 出口线路表未生效（存在无效条目，整表不应用）：%v", err)
 	}
 	// 登录流程的出口（可选）：账号尚不存在，只能按配置里指定的线路走。
-	if cfg.LoginProxy != "" {
-		if err := panel.SetLoginProxy(cfg.LoginProxy); err != nil {
-			log.Printf("WARN: 登录线路 %q 不可用，登录流程回落默认出口：%v", cfg.LoginProxy, err)
-		} else {
-			log.Printf("登录线路：添加账号的 OAuth 流程走 %q", cfg.LoginProxy)
-		}
+	// 无论是否配置都调一次：LoginProxyName 需要初值供面板回显。
+	if err := panel.SetLoginProxy(cfg.LoginProxy); err != nil {
+		log.Printf("WARN: 登录线路 %q 不可用，登录流程回落默认出口：%v", cfg.LoginProxy, err)
+	} else if cfg.LoginProxy != "" {
+		log.Printf("登录线路：添加账号的 OAuth 流程走 %q", cfg.LoginProxy)
 	}
 	if names := upstream.RouteNames(); len(names) > 0 {
 		log.Printf("出口线路已加载：%d 条（%s）—— 账号绑定的线路名按它解析",
@@ -594,16 +593,22 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 
-	// 出口线路表热生效：换表 + 清缓存 + 丢弃按线路缓存的 client。
-	// 已绑定但新表里不存在的线路不会在这里报错——那些账号发请求时会明确失败
-	// （这是刻意的：保存配置时删除一条仍被使用的线路，不该让整个保存失败，
-	// 但必须让人看得见，所以错误仍返回给面板）。
+	// 出口线路表热生效。
+	//
+	// ConfigureRoutes 是「要么全生效、要么全不生效」：有非法条目时一个都不应用，
+	// 表保持原样。所以这里出错**必须照样走完下面的清理**，不能直接 return ——
+	// 早先的写法直接 return 跳过了 ResetRouteClients，而当时 ConfigureRoutes 是
+	// 「先应用再报错」，结果是新表已生效、client 缓存还是旧的（旧地址继续服务）。
+	// 现在两个语义都改了，这条路径才是一致的：出错 = 什么都没变。
 	if err := upstream.ConfigureRoutes(newCfg.Proxies); err != nil {
-		return append(restartRequiredFields(newCfg), "$proxies_warning"),
-			fmt.Errorf("出口线路表已保存，但存在无效条目：%w", err)
+		log.Printf("WARN: 出口线路表未生效（存在无效条目，保持原表）：%v", err)
+		// 登录线路也保持原样，并明确告知保存被拒。
+		return append(restartRequiredFields(newCfg), "$proxies_rejected"),
+			fmt.Errorf("出口线路表未生效：%w", err)
 	}
+	// 换表后必须丢弃按线路缓存的 client（它们绑着旧 Transport）。
 	up.ResetRouteClients()
-	// 登录线路同样热生效；不合法时清空（回落默认出口）并告警，不阻断保存。
+	// 登录线路同样热生效；它是独立的一份 client，换表后必须重建。
 	if err := panel.SetLoginProxy(newCfg.LoginProxy); err != nil {
 		log.Printf("WARN: 保存的登录线路 %q 不可用，登录流程回落默认出口：%v", newCfg.LoginProxy, err)
 		_ = panel.SetLoginProxy("")

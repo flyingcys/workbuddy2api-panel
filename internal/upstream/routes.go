@@ -49,6 +49,14 @@ type routeTable struct {
 	// newTransport 由 main 注入的 Transport 构造器（已带好装配期参数：超时、DNS）。
 	// 未注入时回落 newTransport()——那是「测试裸用/装配未接线」的安全网，生产必须注入。
 	newTransport func() *http.Transport
+
+	// version 每次换表自增。transportFor 在「读表 → 造 Transport → 写缓存」之间
+	// 可能被换表插入：若不校验版本，会把**用旧地址造出的 Transport** 写进新 cache，
+	// 且此后一直命中它（直到下一次换表）。这类串出口没有任何信号，属于最危险形态。
+	version uint64
+
+	// gen 版本号自增器（与 table 同锁，仅在有锁时读写）。
+	gen uint64
 }
 
 var routes = &routeTable{
@@ -74,8 +82,10 @@ func SetRouteTransportFactory(fn func() *http.Transport) {
 
 // ConfigureRoutes 注入「线路名 → 代理地址」表（启动时与保存配置时各调一次；传 nil 清空）。
 //
-// 地址非法时**返回 error 而不是静默丢弃**：启动期宁可带着一条错误日志起来，
-// 也要让人看见「这条线路配错了」；保存期由调用方直接拒绝落盘。
+// **要么全生效、要么全不生效**：地址非法时一个条目都不应用，返回 error 由调用方
+// 拒绝落盘/回滚。早先的实现是「先应用清理后的表、再返回 error」，于是调用方一看
+// 有错就 return，跳过了紧随其后的 ResetRouteClients —— 旧地址的 client 继续服务，
+// 而 UI 显示已保存。这类不一致没有任何信号，是本功能最危险的一类问题。
 func ConfigureRoutes(table map[string]string) error {
 	clean := make(map[string]string, len(table))
 	var bad []string
@@ -85,26 +95,51 @@ func ConfigureRoutes(table map[string]string) error {
 		if n == "" || v == "" {
 			continue
 		}
+		// 保留名不允许出现在表里：transportFor 对它走 transportDirect()，
+		// 表里的地址会被静默忽略 —— 「配了代理却实际直连」，且看不出来。
+		if n == DirectRouteName {
+			bad = append(bad, fmt.Sprintf("%s: 这是保留名，不能当作线路名（它表示「强制直连」）", n))
+			continue
+		}
 		if _, err := normalizeProxyURL(v); err != nil {
 			bad = append(bad, fmt.Sprintf("%s: %v", n, err))
 			continue
 		}
 		clean[n] = v
 	}
-
-	routes.mu.Lock()
-	defer routes.mu.Unlock()
-	// 换表必须清缓存：地址改了要继续用旧代理连接就是串出口。
-	for _, tr := range routes.cache {
-		tr.CloseIdleConnections()
-	}
-	routes.table = clean
-	routes.cache = map[string]*http.Transport{}
 	if len(bad) > 0 {
 		sort.Strings(bad)
+		// 一个条目都不应用：保持调用前的表与缓存原样。
 		return fmt.Errorf("出口线路地址无效：%s", strings.Join(bad, "；"))
 	}
+	applyRoutes(clean)
 	return nil
+}
+
+// applyRoutes 原子换表：换表 + 清缓存 + 关旧连接池 + 版本自增。
+//
+// 所有换表入口（启动、保存配置、面板增删线路）都必须走这里，不允许各自决定
+// 「清什么、什么时候清」——那已经出过一次不一致（见 ConfigureRoutes 注释）。
+func applyRoutes(clean map[string]string) {
+	routes.mu.Lock()
+	old := routes.cache
+	routes.table = clean
+	routes.cache = map[string]*http.Transport{}
+	routes.gen++
+	routes.version = routes.gen
+	routes.mu.Unlock()
+
+	// 关旧池放在锁外：CloseIdleConnections 不阻塞，但没必要在临界区里做。
+	for _, tr := range old {
+		tr.CloseIdleConnections()
+	}
+}
+
+// RouteVersion 当前线路表版本（测试用：断言换表确实推进了版本）。
+func RouteVersion() uint64 {
+	routes.mu.RLock()
+	defer routes.mu.RUnlock()
+	return routes.version
 }
 
 // RouteNames 已配置的线路名（升序；供启动日志与面板下拉）。
@@ -160,6 +195,19 @@ func normalizeProxyURL(raw string) (*url.URL, error) {
 	if u.Port() == "" {
 		return nil, fmt.Errorf("代理地址缺少端口")
 	}
+	// 凭据要么都给、要么都不给：`user@host`（只有用户名）、`user:@host`（空密码）、
+	// `:pass@host`（空用户名）三种对代理必然认证失败，但都过得了上面的格式校验。
+	// 放行它们等于给用户一条「保存成功、每次请求都失败」的线路。
+	if u.User != nil {
+		user := u.User.Username()
+		pass, hasPass := u.User.Password()
+		if strings.TrimSpace(user) == "" {
+			return nil, fmt.Errorf("代理地址有密码但没有用户名")
+		}
+		if !hasPass || pass == "" {
+			return nil, fmt.Errorf("代理地址有用户名但没有密码（凭据要么都填、要么都不填）")
+		}
+	}
 	return u, nil
 }
 
@@ -210,6 +258,7 @@ func (t *routeTable) transportFor(name string) (*http.Transport, error) {
 	t.mu.RLock()
 	addr, known := t.table[name]
 	cached := t.cache[name]
+	ver := t.version
 	t.mu.RUnlock()
 
 	if !known {
@@ -228,9 +277,17 @@ func (t *routeTable) transportFor(name string) (*http.Transport, error) {
 	tr.Proxy = http.ProxyURL(u)
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	// 版本校验：造 Transport 期间表可能被换掉（ConfigureRoutes/applyRoutes 会清缓存
+	// 并 ++version）。此时这个 tr 是用**旧地址**造的，写进新 cache 就是串出口，
+	// 而且此后一直命中 —— 请求成功、UI 正常、出口却不是绑的那条。
+	if t.version != ver {
+		t.mu.Unlock()
+		tr.CloseIdleConnections()
+		return t.transportFor(name) // 用新表重来一次
+	}
 	// 双检：并发首次构造时只保留一个，其余丢弃（否则连接池会分裂）。
 	if again := t.cache[name]; again != nil {
+		t.mu.Unlock()
 		tr.CloseIdleConnections()
 		return again, nil
 	}
@@ -238,6 +295,7 @@ func (t *routeTable) transportFor(name string) (*http.Transport, error) {
 		t.cache = map[string]*http.Transport{}
 	}
 	t.cache[name] = tr
+	t.mu.Unlock()
 	return tr, nil
 }
 
@@ -248,6 +306,7 @@ func (t *routeTable) transportFor(name string) (*http.Transport, error) {
 func (t *routeTable) transportDirect() (*http.Transport, error) {
 	t.mu.RLock()
 	cached := t.cache[DirectRouteName]
+	ver := t.version
 	t.mu.RUnlock()
 	if cached != nil {
 		return cached, nil
@@ -256,8 +315,13 @@ func (t *routeTable) transportDirect() (*http.Transport, error) {
 	tr.Proxy = nil
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	if t.version != ver { // 同 transportFor：换表期间造出的 Transport 作废
+		t.mu.Unlock()
+		tr.CloseIdleConnections()
+		return t.transportDirect()
+	}
 	if again := t.cache[DirectRouteName]; again != nil {
+		t.mu.Unlock()
 		tr.CloseIdleConnections()
 		return again, nil
 	}
@@ -265,6 +329,7 @@ func (t *routeTable) transportDirect() (*http.Transport, error) {
 		t.cache = map[string]*http.Transport{}
 	}
 	t.cache[DirectRouteName] = tr
+	t.mu.Unlock()
 	return tr, nil
 }
 

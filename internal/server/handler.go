@@ -649,6 +649,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
+	// routeFailed 记录「本次轮转里至少有一个号因出口线路故障被跳过」。
+	// 末端出口据此给 502 而不是笼统的 503（no_healthy_account）——否则用户看到
+	// 「没有健康账号」，而真实原因是某个号绑的线路坏了。
+	var routeFailed bool
 	defer func() {
 		if heldUID != "" {
 			h.cfg.Pool.Release(heldUID)
@@ -875,6 +879,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
 				lastErr = err
+				// 出口线路故障：refresh 也是从该账号的线路出去的，线路挂了这里必然
+				// 失败。**不换号、不罚号**——换任何账号都是同一条线路（同 chat 主路径，
+				// 见下面 ChatStreamContext 分支的注释）。漏掉这一处时，三个号会被
+				// 依次喂 NoteError，整池进冷却，而真实原因是线路配错。
+				if upstream.IsRouteUnavailable(err) {
+					st.status = http.StatusBadGateway
+					log.Printf("ERR: [server] refresh 出口线路配置错误 acct=%s: %v（不换号、不罚号）",
+						logfmt.Label(acct.UID, acct.Nickname), err)
+					break
+				}
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
@@ -914,9 +928,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				st.status = http.StatusBadGateway
 				lastErr = terr
-				log.Printf("ERR: [server] 出口线路配置错误 acct=%s: %v（不换号、不罚号）",
+				routeFailed = true
+				log.Printf("ERR: [server] 出口线路配置错误 acct=%s: %v（该号不罚，继续试别的号）",
 					logfmt.Label(acct.UID, acct.Nickname), terr)
-				break
+				// **continue 而不是 break**：线路是**按账号**绑的，坏的是这个号的
+				// 那条线，池里其它号走的是别的线路（或默认出口），它们完全可能正常。
+				// 早先 break 的理由「换任何账号都是同一条线路」只在所有号绑同一条
+				// 线路时才成立；一个号配错就把整池打死是错的。
+				// 不罚号：配置错误与账号健康无关。
+				fail(acct.UID)
+				if !rotateBackoff(i, r.Context()) {
+					break
+				}
+				continue
 			}
 			// 上游超时 / 停滞：**不换号、不罚号**。
 			//
@@ -1244,6 +1268,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(lastErr, errUpstreamTimeout) {
 		code = "upstream_timeout"
 		msg = "upstream timed out: rotation stopped (another account would hit the same slow upstream), please retry later"
+	}
+	// 出口线路配置错误：必须与「没有可用账号」区分开——后者的排查方向是账号池，
+	// 前者的方向是「设置 → 代理」里那条线路。只在**没有其它更具体错误**时使用。
+	if routeFailed && !errors.Is(lastErr, errUpstreamTimeout) {
+		var rue *upstream.RouteUnavailableError
+		if lastErr != nil && errors.As(lastErr, &rue) {
+			status = http.StatusBadGateway
+			code = "egress_route_unavailable"
+			msg = rue.Error()
+		}
 	}
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）固定 no_healthy_account hint。

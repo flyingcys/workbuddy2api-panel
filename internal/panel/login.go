@@ -69,6 +69,12 @@ var loginHTTPMu sync.RWMutex
 func SetLoginProxy(name string) error {
 	name = strings.TrimSpace(name)
 
+	// 记住当前值供面板回显。启动期注入的 Config.LoginProxy 是静态的，保存后
+	// 不更新会让前端每 5 秒轮询把下拉「跳回」旧值。
+	loginProxyMu.Lock()
+	loginProxyCur = name
+	loginProxyMu.Unlock()
+
 	if name == "" {
 		loginHTTPMu.Lock()
 		loginHTTP = &http.Client{Timeout: 30 * time.Second}
@@ -84,6 +90,47 @@ func SetLoginProxy(name string) error {
 	loginHTTP = &http.Client{Timeout: 30 * time.Second, Transport: tr}
 	loginHTTPMu.Unlock()
 	return nil
+}
+
+// inheritProxyName 读磁盘上同路径账号文件里的线路绑定（不存在/解析失败返回空）。
+//
+// 用于「重新登录/重新导入覆盖已有账号」的场景：新结构体没有旧字段，
+// SaveAtomic 会整份重建文件，不显式继承就会把绑定洗掉。
+func inheritProxyName(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	old, err := auth.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return old.ProxyNameValue()
+}
+
+// 登录线路的当前值（供面板回显；SetLoginProxy 唯一写入点）。
+var (
+	loginProxyMu  sync.RWMutex
+	loginProxyCur string
+)
+
+// LoginProxyName 当前生效的登录线路名（空 = 跟随默认出口）。
+func LoginProxyName() string {
+	loginProxyMu.RLock()
+	defer loginProxyMu.RUnlock()
+	return loginProxyCur
+}
+
+// rebuildLoginProxy 按当前线路表重建登录 client（换表之后必须调）。
+//
+// 线路被删/地址变了而 client 不重建，登录会继续从旧出口出去 —— 这在账号还不
+// 存在的时刻发生，用户没有别的信号能发现。
+func (p *Panel) rebuildLoginProxy() error {
+	name := LoginProxyName()
+	if name == "" {
+		return nil
+	}
+	return SetLoginProxy(name)
 }
 
 // loginClient 取当前登录用 client（配置可热改，这里加读锁）。
@@ -256,6 +303,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "mkdir auth dir: "+err.Error())
 		return
 	}
+	filePath := filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID))
 	a := &auth.Auth{
 		AccessToken:  tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
@@ -264,8 +312,13 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		UID:          acct.UID,
 		EnterpriseID: acct.EnterpriseID,
 		Nickname:     acct.Nickname,
-		FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
+		FilePath:     filePath,
+		// 重新登录同一个账号时，必须继承磁盘上已绑定的出口线路。
+		// 本结构体是「从零构造」的，SaveAtomic 又是整份重写 —— 不继承就等于
+		// 重登一次把用户的线路静默解绑（出口跟着变，且没有任何提示）。
+		// （ProxyName 走加锁访问器，故在下面 SetProxyName。）
 	}
+	a.SetProxyName(inheritProxyName(filePath))
 	// global 登录：落盘 auth.realm=global（Realm() 按此判域；不写则依赖 domain 后缀回落）。
 	if sess.realm == "global" {
 		if _, err := auth.BackfillRealmFor(a, "global"); err != nil {

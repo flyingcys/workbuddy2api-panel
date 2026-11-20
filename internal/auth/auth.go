@@ -53,7 +53,30 @@ type Auth struct {
 	// map 全量重写**，不读原文件。若这里不保留该字段，token 一刷新就会把面板绑好的
 	// 线路静默解绑——出口随之改变，而这类变化没人会发现（与 workbuddy-manager
 	// 的 0007 补丁同一教训）。
-	ProxyName string
+	// ProxyName 的并发访问：本字段是**运行期可改**的（面板换绑），而读点遍布
+	// 网关热路径与池状态快照。用独立的小锁而不是复用 a.mu：a.mu 保护的是 token
+	// 一组字段（RefreshToken 在锁内改写），把 ProxyName 塞进去会让面板写绑定时
+	// 与 token 刷新争同一把锁。同理读侧也不能裸读——与写侧的锁不互斥就是数据竞争
+	// （-race 实测会报）。
+	proxyMu sync.RWMutex
+	proxy   string
+}
+
+// ProxyNameValue 加锁读取绑定的线路名（空 = 跟随默认出口）。
+func (a *Auth) ProxyNameValue() string {
+	if a == nil {
+		return ""
+	}
+	a.proxyMu.RLock()
+	defer a.proxyMu.RUnlock()
+	return a.proxy
+}
+
+// SetProxyName 加锁写入绑定的线路名（面板换绑用）。
+func (a *Auth) SetProxyName(name string) {
+	a.proxyMu.Lock()
+	a.proxy = name
+	a.proxyMu.Unlock()
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -329,7 +352,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
-			ProxyName:    strings.TrimSpace(n.Proxy),
+			proxy:        strings.TrimSpace(n.Proxy),
 		}
 	} else {
 		var f struct {
@@ -357,7 +380,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
-			ProxyName:    strings.TrimSpace(f.Proxy),
+			proxy:        strings.TrimSpace(f.Proxy),
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -400,8 +423,8 @@ func (a *Auth) SaveAtomic() error {
 	// ProxyName 同理非空才写回：**本函数是整份重建**，不写回就等于把面板绑好的
 	// 出口线路静默解绑（出口随之改变，而这类变化没人会发现）。空值不写，避免在
 	// 没绑线路的文件里引入空键。
-	if a.ProxyName != "" {
-		doc["proxy"] = a.ProxyName
+	if name := a.ProxyNameValue(); name != "" {
+		doc["proxy"] = name
 	}
 	// ProxyName 同理非空才写回：**本函数是整份重建**，不写回就等于把面板绑好的
 	// 出口线路静默解绑（出口随之改变，而这类变化没人会发现）。空值不写，避免在

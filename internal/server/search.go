@@ -80,6 +80,13 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 			if rerr := h.cfg.Upstream.RefreshToken(acct); rerr != nil {
 				h.cfg.Pool.Release(acct.UID)
 				lastErr = rerr
+				// 出口线路故障：不换号、不罚号（与 chat 的 refresh 分支同理由）。
+				if upstream.IsRouteUnavailable(rerr) {
+					lastStatus = http.StatusBadGateway
+					log.Printf("ERR: [server] 搜索 refresh 出口线路配置错误 acct=%s: %v（不换号、不罚号）",
+						logfmt.Label(acct.UID, acct.Nickname), rerr)
+					break
+				}
 				var ue *upstream.Error
 				if errors.As(rerr, &ue) {
 					lastStatus, lastKind = ue.Status, ue.Kind
@@ -151,6 +158,12 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 	status := http.StatusServiceUnavailable
 	if lastStatus >= 400 && lastStatus < 500 {
 		status = lastStatus
+	}
+	// 出口线路故障是 502（网关侧问题，且**不是**「账号不可用」）：早先只透传
+	// 4xx，502 被这里挡掉 → 客户端看到 503「没有可用账号」，排查方向完全跑偏。
+	var routeErr *upstream.RouteUnavailableError
+	if lastStatus == http.StatusBadGateway && lastErr != nil && errors.As(lastErr, &routeErr) {
+		status = http.StatusBadGateway
 	}
 	if lastKind == upstream.ErrSoftRate {
 		status = http.StatusTooManyRequests

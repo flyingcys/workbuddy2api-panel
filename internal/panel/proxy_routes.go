@@ -141,6 +141,17 @@ func (p *Panel) routesSaveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.cfg.Upstream.ResetRouteClients()
+	// 登录 client 持有的是已解析的 *http.Transport，换表后必须重建 ——
+	// 否则「在代理页删掉一条线路」之后，登录流程仍然从那条（已删除的）线路出去，
+	// 且发生在账号还不存在、无法用账号诊断的时刻。
+	if err := p.rebuildLoginProxy(); err != nil {
+		// 登录线路失效不该让整个保存失败（线路表已落盘并生效），但必须报出来。
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "count": len(next),
+			"login_proxy_warning": err.Error(),
+		})
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "count": len(next)})
 }
@@ -190,31 +201,32 @@ func (p *Panel) accountProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	name := strings.TrimSpace(*body.Proxy)
 
-	// 校验：必须是空 / 保留直连名 / 线路表里存在的名字。
+	// 校验：必须是空 / 保留直连名 / **生效表**里存在的名字。
+	//
+	// 必须查生效表（upstream.RouteAddress）而不是直读 config.json：非法条目会被
+	// ConfigureRoutes 整表拒绝，此时文件里有、内存表里没有。查文件会放行一个
+	// 「绑定成功但请求立刻失败」的状态，并把用户引向线路故障的罚号链。
 	if name != "" && name != upstream.DirectRouteName {
-		table, err := p.loadRouteTable()
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "读取线路表失败："+err.Error())
+		if err := upstream.ValidateRouteName(name); err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("线路名不合法：%v", err))
 			return
 		}
-		if _, ok := table[name]; !ok {
+		if _, ok := upstream.RouteAddress(name); !ok {
 			writeErr(w, http.StatusBadRequest,
-				fmt.Sprintf("线路 %q 不存在（先在「设置 → 代理」里添加）", name))
+				fmt.Sprintf("线路 %q 不存在或未生效（先在「设置 → 代理」里添加并保存）", name))
 			return
 		}
 	}
 
-	// 改内存里的**同一个** *auth.Auth（Pool.AuthByUID 返回池内指针）→ 立即热生效。
-	a.Lock()
-	a.ProxyName = name
-	a.Unlock()
+	// 记下原值：写盘失败要**回滚到原值**，不是回滚到空。
+	// 回滚成空串会让本次运行走默认出口、磁盘仍是旧线路 —— 重启后又变回去，
+	// 两个方向都不对且难以察觉。
+	prev := a.ProxyNameValue()
+	a.SetProxyName(name)
 
 	// 落盘：改的是 ProxyName，但 SaveAtomic 会整份重写，所以必须持有完整凭证。
-	// 失败要回滚内存（否则出现「本次运行生效、重启后还原」的幻觉）。
 	if err := a.SaveAtomic(); err != nil {
-		a.Lock()
-		a.ProxyName = ""
-		a.Unlock()
+		a.SetProxyName(prev)
 		writeErr(w, http.StatusInternalServerError, "写入账号文件失败："+err.Error())
 		return
 	}
@@ -311,7 +323,13 @@ func (p *Panel) writeRouteTable(table map[string]string) error {
 // maskProxyURL 把密码替换为 ***。返回 (脱敏串, 是否带凭据)。
 func maskProxyURL(raw string) (string, bool) {
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.User == nil {
+	if err != nil {
+		// 解析不了也要**藏住**：这条路径处理的是从 config.json 直接读出的值
+		// （写入口会校验，但读入口不校验），原样返回等于把明文密码发给浏览器。
+		// 用粗粒度打码：保留 scheme（便于识别协议），其余全部遮掉。
+		return maskRawProxy(raw), true
+	}
+	if u.User == nil {
 		return raw, false
 	}
 	if _, hasPass := u.User.Password(); !hasPass {
@@ -336,6 +354,29 @@ func maskProxyURL(raw string) (string, bool) {
 	}
 	out += user + ":" + proxyMask + "@" + hostPart
 	return out, true
+}
+
+// maskRawProxy 粗粒度打码：解析不出结构时，按 scheme://***@host 的形态藏。
+//
+// 解析失败常见于凭据里有未编码的特殊字符（`p ss`、`p%zz`）——恰恰是最危险的
+// 明文形态，因为写入口会拒绝它，于是它只可能来自手改 config.json，必须照样遮。
+func maskRawProxy(raw string) string {
+	v := strings.TrimSpace(raw)
+	scheme := "proxy"
+	if i := strings.Index(v, "://"); i > 0 {
+		scheme = v[:i]
+		v = v[i+3:]
+	}
+	host := v
+	if at := strings.LastIndex(v, "@"); at >= 0 {
+		host = v[at+1:]
+	}
+	// 连 host 都可能有敏感信息（内网域名），只留 scheme 更稳妥；但如果能确定
+	// 有 userinfo，host 部分对排查是必要的（确认填的是哪台机器），故保留。
+	if strings.Contains(v, "@") {
+		return scheme + "://***@" + host
+	}
+	return scheme + "://***"
 }
 
 // mergeMaskedProxy 把提交串里的 *** 用已存的密码替换。
@@ -371,7 +412,5 @@ func (p *Panel) accountProxyView(a *auth.Auth) string {
 	if a == nil {
 		return ""
 	}
-	a.Lock()
-	defer a.Unlock()
-	return a.ProxyName
+	return a.ProxyNameValue()
 }

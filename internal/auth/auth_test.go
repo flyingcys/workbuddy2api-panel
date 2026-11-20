@@ -277,8 +277,8 @@ func TestParseProxyNameNestedAndFlat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("nested: %v", err)
 	}
-	if a.ProxyName != "hk-1" {
-		t.Errorf("嵌套形 proxy 未解析：%q", a.ProxyName)
+	if a.ProxyNameValue() != "hk-1" {
+		t.Errorf("嵌套形 proxy 未解析：%q", a.ProxyNameValue())
 	}
 
 	flat := []byte(`{"accessToken":"at","uid":"u2","proxy":"us-2"}`)
@@ -286,8 +286,8 @@ func TestParseProxyNameNestedAndFlat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("flat: %v", err)
 	}
-	if b.ProxyName != "us-2" {
-		t.Errorf("扁平形 proxy 未解析：%q", b.ProxyName)
+	if b.ProxyNameValue() != "us-2" {
+		t.Errorf("扁平形 proxy 未解析：%q", b.ProxyNameValue())
 	}
 
 	// 前后空白要归一（手写文件常见）
@@ -296,8 +296,8 @@ func TestParseProxyNameNestedAndFlat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("spaced: %v", err)
 	}
-	if c.ProxyName != "hk-1" {
-		t.Errorf("proxy 未去空白：%q", c.ProxyName)
+	if c.ProxyNameValue() != "hk-1" {
+		t.Errorf("proxy 未去空白：%q", c.ProxyNameValue())
 	}
 
 	// 没写 proxy 时为空（= 跟随默认出口，零回归）
@@ -306,8 +306,8 @@ func TestParseProxyNameNestedAndFlat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("none: %v", err)
 	}
-	if d.ProxyName != "" {
-		t.Errorf("缺省应为空：%q", d.ProxyName)
+	if d.ProxyNameValue() != "" {
+		t.Errorf("缺省应为空：%q", d.ProxyNameValue())
 	}
 }
 
@@ -319,8 +319,8 @@ func TestSaveAtomicKeepsProxyName(t *testing.T) {
 		RefreshToken: "rt-new",
 		UID:          "u1",
 		FilePath:     path,
-		ProxyName:    "hk-1",
 	}
+	a.SetProxyName("hk-1")
 	if err := a.SaveAtomic(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -338,8 +338,8 @@ func TestSaveAtomicKeepsProxyName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reparse: %v", err)
 	}
-	if back.ProxyName != "hk-1" {
-		t.Errorf("往返后 proxy = %q，期望 hk-1", back.ProxyName)
+	if back.ProxyNameValue() != "hk-1" {
+		t.Errorf("往返后 proxy = %q，期望 hk-1", back.ProxyNameValue())
 	}
 }
 

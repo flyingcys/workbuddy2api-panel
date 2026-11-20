@@ -295,7 +295,9 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"balance_refresh_sec":  p.balanceRefreshSec(),
 		"balance_refreshed_at": p.balanceRefreshedAt(),
 		// 登录线路（「添加账号」的 OAuth 流程走哪条出口）；空 = 跟随默认出口。
-		"login_proxy": p.cfg.LoginProxy,
+		// 读运行时值而不是 Config：Config 是启动期快照，保存后不更新会让前端
+		// 每 5 秒轮询把下拉跳回旧值。
+		"login_proxy": LoginProxyName(),
 	})
 }
 

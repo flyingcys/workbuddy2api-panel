@@ -858,7 +858,7 @@ func (c *Client) chatHTTP() *http.Client {
 func (c *Client) clientFor(a *auth.Auth, kind clientKind) (*http.Client, error) {
 	name := ""
 	if a != nil {
-		name = strings.TrimSpace(a.ProxyName)
+		name = strings.TrimSpace(a.ProxyNameValue())
 	}
 	if name == "" {
 		if kind == kindChat {
@@ -938,7 +938,69 @@ func (c *Client) do(acct *auth.Auth, req *http.Request, kind clientKind) (*http.
 	if err != nil {
 		return nil, err
 	}
-	return client.Do(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		// 线路故障的**第二种形态**：线路名合法、地址格式也合法，但代理本身不可达
+		// （端口拒绝 / SOCKS 认证失败 / DNS 解析不了代理 / 超时）。
+		//
+		// 语义上这与「线路不存在」完全同构：换任何账号都是同一条线路、同一个失败。
+		// 不归类就会掉进 handler 的「网络抖动」分支 → 每个候选账号各喂一次连败 →
+		// 整池进熔断，用户看到 503 而真实原因是代理挂了。
+		if rerr := classifyRouteTransportErr(acct, err); rerr != nil {
+			return nil, rerr
+		}
+	}
+	return resp, err
+}
+
+// classifyRouteTransportErr 把「代理这一跳失败」翻成 RouteUnavailableError；
+// 与线路无关的错误返回 nil（调用方照原样处理）。
+//
+// 抽成函数是必要的：聊天走的不是 do()（它在循环外解析 client），两处都必须
+// 用同一套判据——只改一处就会出现「聊天仍被当账号故障罚号」的残留。
+func classifyRouteTransportErr(acct *auth.Auth, err error) error {
+	if acct == nil || !isRouteTransportError(err) {
+		return nil
+	}
+	name := strings.TrimSpace(acct.ProxyNameValue())
+	if name == "" {
+		return nil // 未绑线路：这个错误与账号线路无关
+	}
+	return &RouteUnavailableError{
+		Account: logfmt.Label(acct.UID, acct.Nickname) + " ",
+		Name:    name,
+		Err:     fmt.Errorf("连接代理失败：%s", proxyTransportReason(err)),
+	}
+}
+
+// isRouteTransportError 判断这个传输层错误是否来自「代理这一跳」而不是目标本身。
+//
+// 只认代理链的**确定性**特征：proxyconnect（HTTP 代理握手）/ socks connect
+// （SOCKS 握手）。目标是 http:// 时代理失败会走 proxyconnect，目标 https 且用
+// SOCKS 时是 socks connect —— 两种都覆盖。
+//
+// 刻意不把泛化的超时算进来：目标上游超时与代理超时在错误里难以区分，误归类会
+// 让「上游慢」变成「线路配置错误」从而停止轮转。宁可漏判到抖动分支。
+func isRouteTransportError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "proxyconnect") || strings.Contains(msg, "socks connect")
+}
+
+// proxyTransportReason 把代理链错误翻成一句可行动的说明（不泄漏地址）。
+func proxyTransportReason(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "username/password authentication failed"):
+		return "代理认证失败（检查用户名与密码）"
+	case strings.Contains(msg, "connection refused"):
+		return "代理端口拒绝连接（确认地址、端口与代理进程）"
+	case strings.Contains(msg, "no such host"), strings.Contains(msg, "lookup "):
+		return "代理域名解析失败（检查地址拼写）"
+	case strings.Contains(msg, "connection not allowed by ruleset"):
+		return "代理拒绝了这个目标（检查代理的白名单/规则）"
+	default:
+		return "代理不可达"
+	}
 }
 
 // defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
@@ -1360,6 +1422,17 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		resp, err := chatClient.Do(req)
 		if err != nil {
 			cancel()
+			// 线路故障的第二种形态（代理不可达 / 认证失败）：必须与「上游抖动」区分，
+			// 否则 handler 会把它当账号问题换号并喂连败，整池熔断。
+			//
+			// 注意这里不能用 c.do()：聊天要在循环外解析一次 client（线路配置错误时
+			// 立刻失败，而不是每个 chatPath 再试一遍），所以走的是 chatClient.Do。
+			// 归类逻辑抽成 classifyRouteTransportErr 供两处共用。
+			if rerr := classifyRouteTransportErr(a, err); rerr != nil {
+				log.Printf("ERR: [upstream] chat_stream acct=%s: 出口线路故障: %v",
+					logfmt.Label(a.UID, a.Nickname), rerr)
+				return nil, 0, nil, rerr
+			}
 			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
 			// 传输层失败 → 清空**该账号所用**连接池的空闲连接（连接层加固）：失败连接
 			// 可能仍留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期

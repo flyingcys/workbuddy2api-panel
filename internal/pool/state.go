@@ -595,7 +595,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Realm:                    e.a.Realm(),
 		Enterprise:               e.a.IsEnterprise(),
 		Nickname:                 e.a.Nickname,
-		ProxyName:                e.a.ProxyName,
+		ProxyName:                e.a.ProxyNameValue(),
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,

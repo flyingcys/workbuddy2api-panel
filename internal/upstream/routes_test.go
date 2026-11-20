@@ -224,7 +224,8 @@ func TestBoundAccountGoesThroughProxy(t *testing.T) {
 	c := routeTestClient(t, srv.URL)
 
 	// ReportChatActivity 经 doJSON → do → 线路 client
-	a := &auth.Auth{AccessToken: "at", UID: "u1", ProxyName: "hk-1"}
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	a.SetProxyName("hk-1")
 	if err := c.ReportChatActivity(a, "conv-1", ""); err != nil {
 		t.Fatalf("report through proxy: %v", err)
 	}
@@ -281,7 +282,9 @@ func TestUnknownRouteFailsAndDoesNotFallBack(t *testing.T) {
 	}
 	c := routeTestClient(t, srv.URL)
 
-	err := c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u3", ProxyName: "nope"}, "conv-3", "")
+	aBad := &auth.Auth{AccessToken: "at", UID: "u3"}
+	aBad.SetProxyName("nope")
+	err := c.ReportChatActivity(aBad, "conv-3", "")
 	if err == nil {
 		t.Fatal("绑了不存在的线路却没报错")
 	}
@@ -317,7 +320,8 @@ func TestDirectRouteBypassesEverything(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "socks5://u:p@"+socks.addr())
 	c := routeTestClient(t, srv.URL)
 
-	a := &auth.Auth{AccessToken: "at", UID: "u4", ProxyName: DirectRouteName}
+	a := &auth.Auth{AccessToken: "at", UID: "u4"}
+	a.SetProxyName(DirectRouteName)
 	if err := c.ReportChatActivity(a, "conv-4", ""); err != nil {
 		t.Fatalf("direct route: %v", err)
 	}
@@ -387,9 +391,19 @@ func TestSocks5hNormalizedToSocks5(t *testing.T) {
 	}
 }
 
-// 地址非法不能阻断其它线路；但必须报出来（启动日志靠它发现问题）。
-func TestConfigureRoutesReportsInvalidWithoutDroppingOthers(t *testing.T) {
+// 地址非法时**整表不生效**（要么全生效、要么全不生效）。
+//
+// 这条语义是为修一个 fail-open 缺陷而定的：早先是「先应用清理后的表、再报错」，
+// 调用方一看有错就 return，跳过了 ResetRouteClients —— 新表已生效、client 缓存
+// 还是旧的地址，请求静默从**旧地址**出去，而 UI 显示保存成功。
+// 现在出错 = 什么都没变，不存在「一半新一半旧」的中间态。
+func TestConfigureRoutesRejectsWholeTableOnInvalidEntry(t *testing.T) {
 	defer ResetRoutesForTest()
+	if err := ConfigureRoutes(map[string]string{"old": "socks5://u:p@127.0.0.1:1111"}); err != nil {
+		t.Fatal(err)
+	}
+	beforeVer := RouteVersion()
+
 	err := ConfigureRoutes(map[string]string{
 		"good": "socks5://u:p@127.0.0.1:1080",
 		"bad":  "socks4://u:p@127.0.0.1:1080",
@@ -397,9 +411,26 @@ func TestConfigureRoutesReportsInvalidWithoutDroppingOthers(t *testing.T) {
 	if err == nil {
 		t.Fatal("非法地址没有报错")
 	}
+	// 整表没动：仍是旧表，版本也没推进
 	names := RouteNames()
-	if len(names) != 1 || names[0] != "good" {
-		t.Fatalf("合法线路被一起丢掉了：%v", names)
+	if len(names) != 1 || names[0] != "old" {
+		t.Fatalf("表被改动了（应当是整表不生效）：%v", names)
+	}
+	if RouteVersion() != beforeVer {
+		t.Errorf("版本被推进了（%d → %d），说明部分生效了", beforeVer, RouteVersion())
+	}
+	if _, ok := RouteAddress("good"); ok {
+		t.Error("非法条目导致整表拒绝，但 good 仍被写进去了")
+	}
+}
+
+// 保留名不能当成普通线路名保存：否则「配了代理却实际直连」，且看不出来。
+func TestConfigureRoutesRejectsDirectReservedName(t *testing.T) {
+	defer ResetRoutesForTest()
+	if err := ConfigureRoutes(map[string]string{
+		DirectRouteName: "socks5://u:p@127.0.0.1:1080",
+	}); err == nil {
+		t.Fatal("__direct__ 作为线路名应当被拒绝（它的地址会被静默忽略）")
 	}
 }
 
@@ -431,7 +462,9 @@ func TestRouteUnavailableErrorTextIsSafe(t *testing.T) {
 	defer ResetRoutesForTest()
 	_ = ConfigureRoutes(map[string]string{})
 	c := routeTestClient(t, "http://127.0.0.1:1")
-	_, err := c.clientFor(&auth.Auth{UID: "u9", ProxyName: "ghost"}, kindShortRPC)
+	aGhost := &auth.Auth{UID: "u9"}
+	aGhost.SetProxyName("ghost")
+	_, err := c.clientFor(aGhost, kindShortRPC)
 	if err == nil {
 		t.Fatal("期望错误")
 	}
@@ -604,105 +637,141 @@ func serveProbeHTTP(ln net.Listener) {
 	}
 }
 
-// ── 全覆盖守卫：8 个出站点都必须受账号线路约束 ──────────────────────────
+// 注：这里曾有一版「手工枚举 10 个出站入口」的全覆盖守卫，已删除。
+// 变异验证证明它是假绿——把 DesktopChatWithExpert / globalModelsOnce /
+// fetchV3ConfigModelMap 改回 c.HTTP.Do，或把 RefreshToken 的账号参数改成 nil，
+// 它全部照旧通过（那三个入口根本不在枚举里）。
+// 判据换成 egress_gate_test.go 的结构化门禁：源码扫描 + nil 账号扫描。
+
+// ── 线路故障的两种形态都要被归类（C2）────────────────────────────────
 //
-// 为什么要这一条：`doJSON` 有 13 个调用点、另有 5 处直接 Do。「只有一部分走了
-// 代理」是本功能最危险的失败形态——界面上看不出，而平台的关联检测看得见。
+// 早先只有「线路名不存在 / 地址非法」被包成 RouteUnavailableError；代理本身
+// 不可达（端口拒绝、认证失败）是普通 *url.Error，会掉进 handler 的「网络抖动」
+// 分支 → 每个候选账号各喂一次连败 → 整池熔断。语义上两者完全同构：换任何账号
+// 都是同一条线路、同一个失败。
+
+func TestRouteTransportFailureIsClassified(t *testing.T) {
+	defer ResetRoutesForTest()
+	SetRouteTransportFactory(func() *http.Transport { return NewRouteTransport() })
+	t.Cleanup(func() { SetRouteTransportFactory(nil) })
+
+	// 端口 1 必然拒绝连接
+	if err := ConfigureRoutes(map[string]string{"dead": "socks5://u:p@127.0.0.1:1"}); err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{
+		HTTP:          &http.Client{Timeout: 2 * time.Second, Transport: NewRouteTransport()},
+		BillingBaseCN: "http://127.0.0.1:9", // 目标地址随便，反正连代理就失败
+	}
+	a := &auth.Auth{UID: "u-dead"}
+	a.SetProxyName("dead")
+
+	err := c.ReportChatActivity(a, "conv", "")
+	if err == nil {
+		t.Fatal("期望连接失败")
+	}
+	if !IsRouteUnavailable(err) {
+		t.Fatalf("代理不可达没有被归类为线路故障（会走换号+罚号）：%T %v", err, err)
+	}
+	// 错误文本不得泄漏地址里的密码
+	if strings.Contains(err.Error(), "u:p@") || strings.Contains(err.Error(), ":p@") {
+		t.Errorf("错误文本泄漏了凭据：%s", err)
+	}
+}
+
+// 认证失败同样归类（需要带认证的 socks 服务器）。
+func TestRouteAuthFailureIsClassified(t *testing.T) {
+	socks := newSocksServer(t, true) // failAuth
+	if err := ConfigureRoutes(map[string]string{"authbad": "socks5://user:pass@" + socks.addr()}); err != nil {
+		t.Fatal(err)
+	}
+	defer ResetRoutesForTest()
+	SetRouteTransportFactory(func() *http.Transport { return NewRouteTransport() })
+	t.Cleanup(func() { SetRouteTransportFactory(nil) })
+
+	c := &Client{
+		HTTP:          &http.Client{Timeout: 3 * time.Second, Transport: NewRouteTransport()},
+		BillingBaseCN: "http://127.0.0.1:9",
+	}
+	a := &auth.Auth{UID: "u-auth"}
+	a.SetProxyName("authbad")
+
+	err := c.ReportChatActivity(a, "conv", "")
+	if err == nil {
+		t.Fatal("认证失败应当报错")
+	}
+	if !IsRouteUnavailable(err) {
+		t.Fatalf("SOCKS 认证失败没有被归类：%T %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "认证失败") {
+		t.Errorf("错误文案不够可行动：%s", err.Error())
+	}
+}
+
+// ── 换表的原子性（C1 / I5）────────────────────────────────────────────
+
+// 换表后必须重建 client：旧 pair 绑着旧 Transport，不重建就继续从旧地址出去。
+func TestRouteVersionAdvancesAndClientRebuilds(t *testing.T) {
+	defer ResetRoutesForTest()
+	SetRouteTransportFactory(func() *http.Transport { return NewRouteTransport() })
+	t.Cleanup(func() { SetRouteTransportFactory(nil) })
+
+	if err := ConfigureRoutes(map[string]string{"r": "socks5://u:p@127.0.0.1:1111"}); err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{HTTP: nil}
+	pair1, err := c.routePair("r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := RouteVersion()
+
+	if err := ConfigureRoutes(map[string]string{"r": "socks5://u:p@127.0.0.1:2222"}); err != nil {
+		t.Fatal(err)
+	}
+	if RouteVersion() == v1 {
+		t.Error("换表没有推进版本号")
+	}
+	// 调用方（main / panel）在换表后必须调 ResetRouteClients；这里验证它确实生效
+	c.ResetRouteClients()
+	pair2, err := c.routePair("r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pair1 == pair2 {
+		t.Fatal("ResetRouteClients 之后仍拿回旧 pair —— 换表不生效")
+	}
+}
+
+// 聊天路径必须同样归类线路故障（C2 的第二个出站点）。
 //
-// 判据：对每个出站入口各打一次，全部经代理；然后用「未绑线路」版本各打一次，
-// 全部不经代理。两条一起才能证明「分派是跟着账号走的」，而不是碰巧全走/全不走。
+// 这条用例是 bug 驱动的：C2 最初只在 do() 里修，而聊天走的是 chatClient.Do
+// （它在循环外解析 client，不走 do），于是聊天仍被当账号抖动 → 换号 + 罚号。
+// 只测 do() 的路径无法发现这一点。
+func TestChatPathClassifiesRouteFailure(t *testing.T) {
+	defer ResetRoutesForTest()
+	SetRouteTransportFactory(func() *http.Transport { return NewRouteTransport() })
+	t.Cleanup(func() { SetRouteTransportFactory(nil) })
 
-func TestAllOutboundPathsHonorRoute(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 宽容响应：这些入口解析失败也不要紧，我们只关心**请求有没有到达**。
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"code":0,"msg":"OK","data":{}}`))
-	}))
-	defer srv.Close()
-
-	newEnv := func(t *testing.T) (*Client, *socksServer) {
-		t.Helper()
-		socks := newSocksServer(t, false)
-		if err := ConfigureRoutes(map[string]string{
-			"hk-1": "socks5://u:p@" + socks.addr(),
-		}); err != nil {
-			t.Fatalf("configure: %v", err)
-		}
-		return routeTestClient(t, srv.URL), socks
+	if err := ConfigureRoutes(map[string]string{"dead": "socks5://u:p@127.0.0.1:1"}); err != nil {
+		t.Fatal(err)
 	}
-
-	// 每个条目：名字 + 用绑定账号调用 + 用未绑账号调用。
-	cases := []struct {
-		name string
-		call func(c *Client, a *auth.Auth) error
-	}{
-		{"doJSON(计费域)", func(c *Client, a *auth.Auth) error {
-			return c.ReportChatActivity(a, "conv", "")
-		}},
-		{"doJSON(成长域)", func(c *Client, a *auth.Auth) error {
-			_, err := c.BuddyInfo(a)
-			return err
-		}},
-		{"doJSON(资料)", func(c *Client, a *auth.Auth) error {
-			_, err := c.FetchAccountProfile(a)
-			return err
-		}},
-		{"doJSON(桌面事件)", func(c *Client, a *auth.Auth) error {
-			return c.ReportDesktopEvent(a, DesktopEvent{})
-		}},
-		{"doJSON(任务)", func(c *Client, a *auth.Auth) error {
-			_, err := c.ListTasks(a)
-			return err
-		}},
-		{"doJSON(学院)", func(c *Client, a *auth.Auth) error {
-			_, err := c.SchoolVouchers(a)
-			return err
-		}},
-		{"doSearch", func(c *Client, a *auth.Auth) error {
-			// 查询串必须 >= SearchMinQueryLen，否则在发请求前就返回了（构造夹具问题，
-			// 不是线路问题——这一条正是被本用例抓出来的）。
-			_, err := c.Search(context.Background(), a, "hello world search", 1, ChatMeta{})
-			return err
-		}},
-		{"globalRegisterJSON", func(c *Client, a *auth.Auth) error {
-			// 同样有前置条件：非 global 账号直接返回，不会发请求。
-			// 注意不能复制 Auth（内含 sync.Mutex，go vet 会报 assignment copies lock）。
-			a.Domain = "www.workbuddy.ai"
-			_, err := c.GlobalFetchCountries(a, true)
-			return err
-		}},
-		{"fetchEnterpriseModels", func(c *Client, a *auth.Auth) error {
-			_, err := c.FetchModels(a)
-			return err
-		}},
-		{"ChatStreamContext", func(c *Client, a *auth.Auth) error {
-			rc, _, _, err := c.ChatStreamContext(context.Background(), a, []byte(`{}`), "", ChatMeta{})
-			if rc != nil {
-				rc.Close()
-			}
-			return err
-		}},
+	c := &Client{
+		HTTP:       &http.Client{Timeout: 2 * time.Second, Transport: NewRouteTransport()},
+		ChatHTTP:   &http.Client{Timeout: 0, Transport: NewRouteTransport()},
+		ChatBaseCN: "http://127.0.0.1:9",
 	}
+	a := &auth.Auth{AccessToken: "at", UID: "u-chat"}
+	a.SetProxyName("dead")
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			// ① 绑定账号 → 必须经代理
-			c, socks := newEnv(t)
-			a := &auth.Auth{AccessToken: "at", UID: "u-bound", ProxyName: "hk-1"}
-			_ = tc.call(c, a) // 返回值不重要（本地假上游可能解析失败），只看有没有连出去
-			if n := len(socks.connectsSnapshot()); n == 0 {
-				t.Fatalf("%s：绑定账号的请求没有经过代理（该路径漏了线路约束）", tc.name)
-			}
-
-			// ② 未绑账号 → 必须不经代理（零回归）
-			ResetRoutesForTest()
-			resetRouteClientsForTest()
-			c2, socks2 := newEnv(t)
-			b := &auth.Auth{AccessToken: "at", UID: "u-unbound"}
-			_ = tc.call(c2, b)
-			if n := len(socks2.connectsSnapshot()); n != 0 {
-				t.Fatalf("%s：未绑线路的账号走了代理（CONNECT=%d）", tc.name, n)
-			}
-		})
+	rc, _, _, err := c.ChatStreamContext(context.Background(), a, []byte(`{}`), "", ChatMeta{})
+	if rc != nil {
+		rc.Close()
+	}
+	if err == nil {
+		t.Fatal("期望线路故障")
+	}
+	if !IsRouteUnavailable(err) {
+		t.Fatalf("聊天路径没有归类线路故障（会被当账号抖动换号罚号）：%T %v", err, err)
 	}
 }

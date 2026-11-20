@@ -183,7 +183,7 @@ func TestAccountProxyBindPersistsAndApplies(t *testing.T) {
 	}
 
 	// ① 内存立即生效（池内是同一个指针，网关下一次请求就会用新线路）
-	if got := e.pool.AuthByUID("u1").ProxyName; got != "hk-1" {
+	if got := e.pool.AuthByUID("u1").ProxyNameValue(); got != "hk-1" {
 		t.Fatalf("内存未生效：%q", got)
 	}
 	// ② 落盘
@@ -196,8 +196,8 @@ func TestAccountProxyBindPersistsAndApplies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if back.ProxyName != "hk-1" {
-		t.Fatalf("重启后绑定丢失：%q", back.ProxyName)
+	if back.ProxyNameValue() != "hk-1" {
+		t.Fatalf("重启后绑定丢失：%q", back.ProxyNameValue())
 	}
 	// ④ 状态接口回显
 	if st, ok := e.pool.Status("u1"); !ok || st.ProxyName != "hk-1" {
@@ -240,13 +240,13 @@ func TestAccountProxyAcceptsEmptyAndDirect(t *testing.T) {
 		`{"proxy":"`+upstream.DirectRouteName+`"}`); code != 200 {
 		t.Fatalf("direct: %d %v", code, b)
 	}
-	if got := e.pool.AuthByUID("u1").ProxyName; got != upstream.DirectRouteName {
+	if got := e.pool.AuthByUID("u1").ProxyNameValue(); got != upstream.DirectRouteName {
 		t.Fatalf("got %q", got)
 	}
 	if code, b := e.do(t, "PUT", "/panel/api/accounts/u1/proxy", `{"proxy":""}`); code != 200 {
 		t.Fatalf("clear: %d %v", code, b)
 	}
-	if got := e.pool.AuthByUID("u1").ProxyName; got != "" {
+	if got := e.pool.AuthByUID("u1").ProxyNameValue(); got != "" {
 		t.Fatalf("解绑后仍为 %q", got)
 	}
 	raw, _ := os.ReadFile(e.accountFile)
@@ -274,7 +274,7 @@ func TestDeletingBoundRouteIsAllowedButVisible(t *testing.T) {
 		t.Fatalf("线路表应为空：%v", routes)
 	}
 	// 账号绑定仍然在（不清空 = 不偷偷改变出口；发请求时会明确报错）
-	if got := e.pool.AuthByUID("u1").ProxyName; got != "hk-1" {
+	if got := e.pool.AuthByUID("u1").ProxyNameValue(); got != "hk-1" {
 		t.Fatalf("删除线路不该顺手清掉账号绑定：%q", got)
 	}
 }
