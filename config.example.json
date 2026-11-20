@@ -4,6 +4,8 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "dns_servers": [],
+  "proxies": {},
+  "login_proxy": "",
   "server": {
     "read_timeout": "300s"
   },

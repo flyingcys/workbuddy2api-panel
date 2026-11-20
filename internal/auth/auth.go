@@ -44,6 +44,16 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// ProxyName 账号级出口线路**名**（不是地址），来源 auth 文件顶层 `proxy` 字段。
+	// 线路名 → 代理地址的映射在 config.json 的 `proxies` 段；空 = 跟随进程级默认出口
+	// （共享 Transport，即环境变量代理或直连）。保留名 `__direct__` = 强制直连。
+	//
+	// 为什么必须放进 Auth 并在 SaveAtomic 里写回：SaveAtomic 是**从 struct 零构造
+	// map 全量重写**，不读原文件。若这里不保留该字段，token 一刷新就会把面板绑好的
+	// 线路静默解绑——出口随之改变，而这类变化没人会发现（与 workbuddy-manager
+	// 的 0007 补丁同一教训）。
+	ProxyName string
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -303,6 +313,8 @@ func Parse(raw []byte) (*Auth, error) {
 			} `json:"account"`
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
 			DeviceToken string `json:"device_token"`
+			// Proxy 顶层 proxy（线路名，面板写入；见 Auth.ProxyName）。
+			Proxy string `json:"proxy"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -317,6 +329,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			ProxyName:    strings.TrimSpace(n.Proxy),
 		}
 	} else {
 		var f struct {
@@ -329,6 +342,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
 			DeviceToken  string `json:"device_token"`
+			Proxy        string `json:"proxy"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -343,6 +357,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			ProxyName:    strings.TrimSpace(f.Proxy),
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -382,6 +397,16 @@ func (a *Auth) SaveAtomic() error {
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
 	}
+	// ProxyName 同理非空才写回：**本函数是整份重建**，不写回就等于把面板绑好的
+	// 出口线路静默解绑（出口随之改变，而这类变化没人会发现）。空值不写，避免在
+	// 没绑线路的文件里引入空键。
+	if a.ProxyName != "" {
+		doc["proxy"] = a.ProxyName
+	}
+	// ProxyName 同理非空才写回：**本函数是整份重建**，不写回就等于把面板绑好的
+	// 出口线路静默解绑（出口随之改变，而这类变化没人会发现）。空值不写，避免在
+	// 没绑线路的文件里引入空键。
+
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err

@@ -264,3 +264,94 @@ func TestLoadDirDuplicateUIDWarning(t *testing.T) {
 		t.Errorf("expected WARN with both paths, got output: %s", string(raw))
 	}
 }
+
+// ── 账号级出口线路：proxy 字段必须能被解析、且写回时不被洗掉 ─────────────
+//
+// SaveAtomic 是「从 struct 零构造 map 全量重写」，不读原文件。所以字段不进
+// Auth 就必然在 token 刷新后消失——表现是「面板绑好的线路，第一次刷新后静默
+// 解绑」，出口随之改变且没人会发现。
+
+func TestParseProxyNameNestedAndFlat(t *testing.T) {
+	nested := []byte(`{"auth":{"accessToken":"at"},"account":{"uid":"u1"},"proxy":"hk-1"}`)
+	a, err := Parse(nested)
+	if err != nil {
+		t.Fatalf("nested: %v", err)
+	}
+	if a.ProxyName != "hk-1" {
+		t.Errorf("嵌套形 proxy 未解析：%q", a.ProxyName)
+	}
+
+	flat := []byte(`{"accessToken":"at","uid":"u2","proxy":"us-2"}`)
+	b, err := Parse(flat)
+	if err != nil {
+		t.Fatalf("flat: %v", err)
+	}
+	if b.ProxyName != "us-2" {
+		t.Errorf("扁平形 proxy 未解析：%q", b.ProxyName)
+	}
+
+	// 前后空白要归一（手写文件常见）
+	spaced := []byte(`{"accessToken":"at","uid":"u3","proxy":"  hk-1  "}`)
+	c, err := Parse(spaced)
+	if err != nil {
+		t.Fatalf("spaced: %v", err)
+	}
+	if c.ProxyName != "hk-1" {
+		t.Errorf("proxy 未去空白：%q", c.ProxyName)
+	}
+
+	// 没写 proxy 时为空（= 跟随默认出口，零回归）
+	none := []byte(`{"accessToken":"at","uid":"u4"}`)
+	d, err := Parse(none)
+	if err != nil {
+		t.Fatalf("none: %v", err)
+	}
+	if d.ProxyName != "" {
+		t.Errorf("缺省应为空：%q", d.ProxyName)
+	}
+}
+
+func TestSaveAtomicKeepsProxyName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "workbuddy-u1.json")
+	a := &Auth{
+		AccessToken:  "at-new",
+		RefreshToken: "rt-new",
+		UID:          "u1",
+		FilePath:     path,
+		ProxyName:    "hk-1",
+	}
+	if err := a.SaveAtomic(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(raw), `"proxy": "hk-1"`) {
+		t.Fatalf("写回后 proxy 丢失（绑定会被静默解绑）：\n%s", raw)
+	}
+
+	// 重新解析应当还能读回来（往返一致）
+	back, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("reparse: %v", err)
+	}
+	if back.ProxyName != "hk-1" {
+		t.Errorf("往返后 proxy = %q，期望 hk-1", back.ProxyName)
+	}
+}
+
+func TestSaveAtomicOmitsEmptyProxy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "workbuddy-u2.json")
+	a := &Auth{AccessToken: "at", UID: "u2", FilePath: path}
+	if err := a.SaveAtomic(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	raw, _ := os.ReadFile(path)
+	if strings.Contains(string(raw), `"proxy"`) {
+		t.Fatalf("未绑线路的文件不该出现 proxy 键：\n%s", raw)
+	}
+}

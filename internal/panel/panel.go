@@ -65,6 +65,14 @@ type Config struct {
 	// 留痕由余额查询路径（upstream.Client 的余额观察者）写入。
 	CreditHistory *credithist.Ledger
 
+	// LoginProxy 「添加账号」的登录流程走哪条线路（空 = 进程默认出口）。
+	// 只读回显；实际生效由 main 启动/保存时调 SetLoginProxy 完成。
+	LoginProxy string
+
+	// ProbeURL 「测试出口」用的查询端点（空 = panel.ProbeURLDefault）。
+	// 出口检查服务各区域可达性差别很大，某些部署需要换成自己的端点。
+	ProbeURL string
+
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
@@ -193,6 +201,12 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	// 出口线路（见 docs/account-egress-plan.md）：
+	//   线路表 → config.json 的 proxies 段；账号绑定 → auths/*.json 顶层 proxy。
+	p.mux.HandleFunc("GET /panel/api/proxy/routes", p.withAuth(p.routesHandler))
+	p.mux.HandleFunc("PUT /panel/api/proxy/routes", p.withAuth(p.routesSaveHandler))
+	p.mux.HandleFunc("PUT /panel/api/accounts/{uid}/proxy", p.withAuth(p.accountProxyHandler))
+	p.mux.HandleFunc("POST /panel/api/proxy/probe", p.withAuth(p.probeRouteHandler))
 	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensationClaim))
 	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
@@ -278,8 +292,10 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
+		// 登录线路（「添加账号」的 OAuth 流程走哪条出口）；空 = 跟随默认出口。
+		"login_proxy": p.cfg.LoginProxy,
 	})
 }
 

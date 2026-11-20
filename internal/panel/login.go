@@ -18,9 +18,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 const (
@@ -50,6 +54,44 @@ func loginEndpoints(realm string) (state, token, account, origin string) {
 
 // loginHTTP 设备授权专用 client：短超时、无 cookie（每请求携带 state，无会话态）。
 var loginHTTP = &http.Client{Timeout: 30 * time.Second}
+
+// loginHTTPMu 保护 loginHTTP 的替换（配置保存时热更新，请求并发读）。
+var loginHTTPMu sync.RWMutex
+
+// SetLoginProxy 指定「添加账号」的登录流程走哪条出口线路（空 = 进程默认出口）。
+//
+// 为什么需要：登录时账号还不存在，拿不到账号绑定的线路；但 OAuth 握手与
+// 换 token 都是真实打到腾讯域名的请求——加号那一步从家宽出去，等于在
+// 「还没有账号」的时刻就已经暴露了出口 IP。
+//
+// 不指定（默认）时行为与改动前逐字相同：走共享的默认出口。
+// 指定的线路不存在时返回 error，调用方决定是拒绝启动/保存还是仅告警。
+func SetLoginProxy(name string) error {
+	name = strings.TrimSpace(name)
+
+	if name == "" {
+		loginHTTPMu.Lock()
+		loginHTTP = &http.Client{Timeout: 30 * time.Second}
+		loginHTTPMu.Unlock()
+		return nil
+	}
+
+	tr, err := upstream.TransportForRoute(name)
+	if err != nil {
+		return err
+	}
+	loginHTTPMu.Lock()
+	loginHTTP = &http.Client{Timeout: 30 * time.Second, Transport: tr}
+	loginHTTPMu.Unlock()
+	return nil
+}
+
+// loginClient 取当前登录用 client（配置可热改，这里加读锁）。
+func loginClient() *http.Client {
+	loginHTTPMu.RLock()
+	defer loginHTTPMu.RUnlock()
+	return loginHTTP
+}
 
 func commonHeaders(req *http.Request, origin string) {
 	req.Header.Set("Content-Type", "application/json")
@@ -94,7 +136,7 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	resp, err := loginHTTP.Do(req)
+	resp, err := loginClient().Do(req)
 	if err != nil {
 		return nil, 0, err
 	}

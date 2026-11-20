@@ -630,6 +630,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
+      <li><a href="#proxy" data-view="proxy">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="3.2" cy="8" r="1.8"/><circle cx="12.8" cy="4" r="1.8"/><circle cx="12.8" cy="12" r="1.8"/><path d="M5 8l6-3.2M5 8l6 3.2"/></svg>
+        代理</a></li>
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
@@ -717,7 +720,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <table class="acc">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
+            <th>账号</th><th>状态</th><th>出口</th><th>积分</th>
             <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
@@ -934,6 +937,59 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </section>
 
     <!-- 配置 -->
+    <section class="view" id="view-proxy" hidden>
+      <div class="box">
+        <header>
+          <h3>出口线路 <span class="hint">一个账号一条出口 · 支持 http / https / socks5 / socks5h</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="pxNote"></span>
+          <button class="xs" id="btnPxAdd">添加线路</button>
+          <button class="xs primary" id="btnPxSave">保存</button>
+        </header>
+        <div class="pad">
+          <p class="hint" style="margin:0 0 8px">
+            线路名 → 代理地址。账号在「账号池」的「出口」列里选线路；不选 = 跟随进程默认出口
+            （<code>HTTP_PROXY</code> 环境变量或直连）。线路不存在或地址非法时，绑定的账号请求会
+            <b>明确失败</b> —— 不会静默改走别的出口。密码显示为 <code>***</code>，不动它就保持不变。
+          </p>
+          <div class="tbl-wrap">
+            <table class="acc">
+              <thead><tr>
+                <th style="width:180px">线路名</th><th>代理地址</th>
+                <th style="width:90px" class="num">绑定账号</th><th class="c-acts"></th>
+              </tr></thead>
+              <tbody id="pxBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="box">
+        <header><h3>添加账号时的出口</h3></header>
+        <div class="pad">
+          <label class="fld"><span class="lb">登录线路</span>
+            <select id="pxLogin"></select>
+            <span class="hint">
+              登录时还没有账号，拿不到账号绑定的线路。这里指定一条，OAuth 握手与换 token
+              就从它出去；不选 = 走进程默认出口（<code>HTTP_PROXY</code> 或直连）。
+            </span></label>
+          <button class="xs primary" id="btnPxLoginSave">保存登录线路</button>
+        </div>
+      </div>
+
+      <div class="box">
+        <header><h3>怎么填代理地址</h3></header>
+        <div class="pad">
+          <p class="hint" style="margin:0 0 6px">住宅代理服务商通常给这种形式（用户名里带国家/城市/会话参数）：</p>
+          <pre style="margin:0 0 10px;overflow-x:auto"><code>socks5://用户_c_CN_city_Shanghai_s_abc:密码@网关地址:10000</code></pre>
+          <p class="hint" style="margin:0">
+            用户名或密码里的中文与其他特殊字符需要百分号编码（保存时会自动转义）。
+            同一个会话名会粘同一个出口 IP —— 每个账号要用不同会话名才能各占一个 IP。
+            <code>socks5h://</code> 与 <code>socks5://</code> 等价，保存时统一存成后者。
+          </p>
+        </div>
+      </div>
+    </section>
+
     <section class="view" id="view-config" hidden>
       <form id="cfgForm">
         <div class="box">

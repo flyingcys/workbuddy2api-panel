@@ -789,7 +789,30 @@ type Client struct {
 	// creditObserver 余额查询观察者（见 CreditObserver / SetCreditObserver）。
 	// atomic：启动期挂载、运行期并发读，不参与任何出站决策。
 	creditObserver atomic.Pointer[CreditObserver]
+
+	// routeClients 按线路名缓存的 outbound client（见 clientFor）。
+	// 与 HTTP/ChatHTTP 是两个维度：那对是「默认出口」，这里是「账号绑了线路时的出口」。
+	// 键是 routeKey = 线路名，值为该线路的 shortRPC/chat 两个 client。
+	routeMu      sync.RWMutex
+	routeClients map[string]*routeClientPair
 }
+
+// routeClientPair 一条线路的两个 client：短 RPC（有总超时）与聊天（无总超时）。
+// 体积可以忽略：两者的区别只有 Timeout 字段，Transport 是同一个。
+type routeClientPair struct {
+	short *http.Client
+	chat  *http.Client
+}
+
+// clientKind 出站请求的两类超时语义。
+type clientKind int
+
+const (
+	// kindShortRPC 短请求（refresh / 签到 / 余额 / 任务 / 上报）：受 HTTP.Timeout 约束。
+	kindShortRPC clientKind = iota
+	// kindChat 聊天 SSE：无总时长，首字节由 Transport.ResponseHeaderTimeout 约束。
+	kindChat
+)
 
 // CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
 // 旁路通知，不改变任何透传字节；未挂载时零开销。用于积分历史留痕
@@ -822,6 +845,100 @@ func (c *Client) chatHTTP() *http.Client {
 		return c.ChatHTTP
 	}
 	return c.HTTP
+}
+
+// clientFor 返回该账号这次出站应使用的 client。
+//
+//	未绑线路（ProxyName 为空 / a 为 nil）→ 共享 client，行为逐字不变（零回归）
+//	绑了线路                            → 该线路专属 client（Transport 按线路缓存）
+//	线路不存在 / 地址非法               → ErrRouteUnavailable，**不静默直连**
+//
+// 为什么「不静默直连」是硬性的：静默回落给出的是「以为隔离了其实没隔离」这个
+// 最坏结果，而且没有任何错误信号能让人发现。
+func (c *Client) clientFor(a *auth.Auth, kind clientKind) (*http.Client, error) {
+	name := ""
+	if a != nil {
+		name = strings.TrimSpace(a.ProxyName)
+	}
+	if name == "" {
+		if kind == kindChat {
+			return c.chatHTTP(), nil
+		}
+		if c.HTTP != nil {
+			return c.HTTP, nil
+		}
+		// 兜底（测试/未接线）：与 New() 的短 RPC 语义一致。
+		return &http.Client{Timeout: 120 * time.Second, Transport: newTransport()}, nil
+	}
+
+	pair, err := c.routePair(name)
+	if err != nil {
+		label := ""
+		if a != nil {
+			label = logfmt.Label(a.UID, a.Nickname) + " "
+		}
+		return nil, &RouteUnavailableError{Account: label, Name: name, Err: err}
+	}
+	if kind == kindChat {
+		return pair.chat, nil
+	}
+	return pair.short, nil
+}
+
+// routePair 取得（必要时构造）某条线路的 client 对。
+func (c *Client) routePair(name string) (*routeClientPair, error) {
+	c.routeMu.RLock()
+	pair := c.routeClients[name]
+	c.routeMu.RUnlock()
+	if pair != nil {
+		return pair, nil
+	}
+
+	tr, err := routes.transportFor(name)
+	if err != nil {
+		return nil, err
+	}
+
+	// 超时沿用本实例的**当前**值（main 在装配期改写 HTTP.Timeout，调度器/面板
+	// 也读同一个值）；不用字面量，避免「绑了线路的账号超时被偷偷换掉」。
+	shortTimeout := 120 * time.Second
+	if c.HTTP != nil && c.HTTP.Timeout > 0 {
+		shortTimeout = c.HTTP.Timeout
+	}
+	fresh := &routeClientPair{
+		short: &http.Client{Timeout: shortTimeout, Transport: tr},
+		chat:  &http.Client{Timeout: 0, Transport: tr},
+	}
+
+	c.routeMu.Lock()
+	defer c.routeMu.Unlock()
+	if c.routeClients == nil {
+		c.routeClients = map[string]*routeClientPair{}
+	}
+	// 双检：并发首次构造时只保留一个，其余丢弃（否则连接池会分裂）。
+	if again := c.routeClients[name]; again != nil {
+		return again, nil
+	}
+	c.routeClients[name] = fresh
+	return fresh, nil
+}
+
+// ResetRouteClients 丢弃按线路缓存的 client（线路表变更后必须调用）。
+func (c *Client) ResetRouteClients() {
+	c.routeMu.Lock()
+	defer c.routeMu.Unlock()
+	c.routeClients = nil
+}
+
+// do 是所有出站请求的**唯一发出点**（9 处 Do 中的 8 处经此；models.dev 公共目录除外）。
+//
+// acct 为 nil 或未绑线路时等价于原来的 c.HTTP.Do / c.chatHTTP().Do，逐字不变。
+func (c *Client) do(acct *auth.Auth, req *http.Request, kind clientKind) (*http.Response, error) {
+	client, err := c.clientFor(acct, kind)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
 }
 
 // defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
@@ -974,8 +1091,11 @@ func (c *Client) webBase(a *auth.Auth) string {
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+//
+// acct 用于选账号级出口线路（见 clientFor）。**13 个调用点全部持账号**，
+// 新增调用点也必须传：传 nil 会静默走默认出口，等于该请求不受线路约束。
+func (c *Client) doJSON(acct *auth.Auth, req *http.Request) (json.RawMessage, error) {
+	resp, err := c.do(acct, req, kindShortRPC)
 	if err != nil {
 		return nil, err
 	}
@@ -1134,7 +1254,7 @@ func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		return err
 	}
@@ -1216,6 +1336,13 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
+	// 账号级出口线路：聊天 client 在循环外解析一次（线路配置错误时立刻失败）。
+	// 不能放进循环体：那会让「线路不存在」随着 chatPaths 的多个候选路径重复尝试，
+	// 错误信息还会被后续路径覆盖。
+	chatClient, cerr := c.clientFor(a, kindChat)
+	if cerr != nil {
+		return nil, 0, nil, cerr
+	}
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -1230,14 +1357,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
-		resp, err := c.chatHTTP().Do(req)
+		resp, err := chatClient.Do(req)
 		if err != nil {
 			cancel()
 			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
-			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能仍
-			// 留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
-			// 不够，主动清池才断根。
-			roundTripCloseIdle(c.chatHTTP().Transport)
+			// 传输层失败 → 清空**该账号所用**连接池的空闲连接（连接层加固）：失败连接
+			// 可能仍留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
+			// 不够，主动清池才断根。注意清的必须是 chatClient 的池：绑线路的账号用的是
+			// 线路专属 Transport，清共享池对它的失败连接无效。
+			roundTripCloseIdle(chatClient.Transport)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -1519,7 +1647,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(a, req, kindShortRPC)
 	if err != nil {
 		return nil, err
 	}
@@ -1873,7 +2001,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	}
 	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(a, req, kindShortRPC)
 	if err != nil {
 		return nil, err
 	}

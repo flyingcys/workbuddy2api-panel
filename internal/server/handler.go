@@ -904,6 +904,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = uerr.Status
 		}
 		if uerr == nil && terr != nil {
+			// 账号绑定的出口线路不可用（线路名不存在 / 地址非法 / 被删）：
+			// **不换号、不罚号、直接报错**。
+			//
+			// 这是配置问题，不是账号问题：换任何账号都是同一条线路、同一个失败。
+			// 若走下面的「网络抖动」分支，每个候选账号都会被喂一次连败计数，
+			// 最终整池进熔断——用户看到 503「服务不可用」，而真实原因是配置写错了。
+			if upstream.IsRouteUnavailable(terr) {
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+				st.status = http.StatusBadGateway
+				lastErr = terr
+				log.Printf("ERR: [server] 出口线路配置错误 acct=%s: %v（不换号、不罚号）",
+					logfmt.Label(acct.UID, acct.Nickname), terr)
+				break
+			}
 			// 上游超时 / 停滞：**不换号、不罚号**。
 			//
 			// 超时不是账号的问题：同一份请求换到别的号，撞上的是同一个慢上游，

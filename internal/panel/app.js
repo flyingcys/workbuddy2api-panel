@@ -351,13 +351,14 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', proxy: '代理', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
+  if (v === 'proxy') loadProxyEditor();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
@@ -380,10 +381,196 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+/* ── 账号级出口线路 ───────────────────────────────────────────────
+ * 线路表存在 config.json 的 proxies 段；账号绑定写 auths/*.json 顶层 proxy。
+ * 绑定为空 = 跟随默认出口（共享 Transport，即环境变量代理或直连）；
+ * DIRECT_NAME = 强制直连（绕过线路池**和**环境变量代理）。
+ */
+let proxyState = { routes: [], direct: '__direct__', writable: false };
+
+function routeLabel(name) {
+  if (!name) return '<span class="hint" style="color:var(--ink-3)">默认</span>';
+  if (name === proxyState.direct) return '<span class="tag">直连</span>';
+  const known = proxyState.routes.some(r => r.name === name);
+  if (!known) return '<span class="tag bad" title="线路已不存在，请求会明确失败">' + esc(name) + '</span>';
+  return esc(name);
+}
+
+function proxyCellHtml(s) {
+  const cur = s.proxy || '';
+  const opts = ['<option value=""' + (cur === '' ? ' selected' : '') + '>默认出口</option>',
+                '<option value="' + esc(proxyState.direct) + '"' + (cur === proxyState.direct ? ' selected' : '') + '>强制直连</option>']
+    .concat(proxyState.routes.map(r =>
+      '<option value="' + esc(r.name) + '"' + (cur === r.name ? ' selected' : '') + '>' + esc(r.name) + '</option>'));
+  // 绑定了一个不在表里的线路：也渲染出来，否则下拉会静默显示成「默认」
+  if (cur && cur !== proxyState.direct && !proxyState.routes.some(r => r.name === cur)) {
+    opts.push('<option value="' + esc(cur) + '" selected>' + esc(cur) + '（已失效）</option>');
+  }
+  return '<td class="pxy"><select class="pxy-sel" data-u="' + esc(s.uid) + '" title="该账号所有出站请求的出口线路">' +
+    opts.join('') + '</select></td>';
+}
+
+async function loadProxyRoutes() {
+  try {
+    const d = await api('proxy/routes');
+    proxyState.routes = d.routes || [];
+    proxyState.direct = d.direct_name || '__direct__';
+    proxyState.writable = !!d.writable;
+  } catch (e) { /* 线路表读不到不影响账号页：下拉只剩「默认出口」 */ }
+}
+
+/* ── 代理设置页：「设置 → 代理」的线路表编辑器 ─────────────────────
+ * 整表提交（PUT /panel/api/proxy/routes）：前端表格是唯一事实来源，
+ * 保存时一次性替换。地址里的 *** 由后端还原成已存密码。
+ */
+let pxRows = [];   // [{name, url, accounts, dirty}]
+
+async function loadProxyEditor() {
+  try {
+    const d = await api('proxy/routes');
+    proxyState.routes = d.routes || [];
+    proxyState.direct = d.direct_name || '__direct__';
+    proxyState.writable = !!d.writable;
+    pxRows = (d.routes || []).map(r => ({ name: r.name, url: r.url, accounts: r.accounts || 0 }));
+    $('pxNote').textContent = d.writable ? '' : 'config.json 不可写（只读展示）';
+  } catch (e) {
+    $('pxNote').textContent = '读取失败：' + e.message;
+    pxRows = [];
+  }
+  renderProxyRows();
+  renderLoginSelect();
+}
+
+// 登录线路下拉：选项 = 线路表 + 「跟随默认出口」。
+function renderLoginSelect() {
+  const sel = $('pxLogin');
+  if (!sel) return;
+  const cur = (overviewData && overviewData.login_proxy) || '';
+  const opts = ['<option value="">跟随默认出口</option>']
+    .concat(proxyState.routes.map(r => '<option value="' + esc(r.name) + '">' + esc(r.name) + '</option>'));
+  if (cur && !proxyState.routes.some(r => r.name === cur)) {
+    opts.push('<option value="' + esc(cur) + '">' + esc(cur) + '（已失效）</option>');
+  }
+  sel.innerHTML = opts.join('');
+  sel.value = cur || '';
+}
+
+let loginProxyCur = '';
+
+$('btnPxLoginSave').onclick = async () => {
+  const name = $('pxLogin').value || '';
+  try {
+    await api('config', {
+      method: 'POST',
+      body: JSON.stringify({ login_proxy: name }),
+    });
+    loginProxyCur = name;
+    toast(name ? ('登录线路已设为 ' + name) : '登录线路已清空（跟随默认出口）', 'ok');
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+  }
+};
+
+function renderProxyRows() {
+  const tb = $('pxBody');
+  if (!pxRows.length) {
+    tb.innerHTML = '<tr><td colspan="4"><div class="empty">还没有配置任何线路。点右上角「添加线路」。' +
+      '<br>不配也能用 —— 账号会走进程默认出口。</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = pxRows.map((r, i) =>
+    '<tr>' +
+      '<td><input class="px-name" data-i="' + i + '" value="' + esc(r.name) + '" placeholder="hk-1"' +
+        (r.accounts ? ' title="已有 ' + r.accounts + ' 个账号绑定这条线路"' : '') + '></td>' +
+      '<td><input class="px-url" data-i="' + i + '" value="' + esc(r.url) + '" placeholder="socks5://user:pass@host:1080"></td>' +
+      '<td class="num">' + (r.accounts || 0) + '</td>' +
+      '<td class="acts">' +
+        '<button class="xs ghost" data-px-test="' + i + '">测试</button>' +
+        '<button class="xs ghost danger" data-px-del="' + i + '">删除</button></td>' +
+    '</tr>').join('');
+}
+
+$('btnPxAdd').onclick = () => {
+  pxRows.push({ name: '', url: '', accounts: 0 });
+  renderProxyRows();
+};
+
+$('pxBody').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-px-del]');
+  if (!b) return;
+  const i = Number(b.dataset.pxDel);
+  const row = pxRows[i];
+  if (row && row.accounts > 0 &&
+      !confirm('有 ' + row.accounts + ' 个账号绑定在这条线路上。删除后它们的请求会明确失败（不会改走别的出口）。确认删除？')) return;
+  pxRows.splice(i, 1);
+  renderProxyRows();
+});
+
+// 测试出口：经这条线路打一次探测端点，回出口 IP 与归属地。
+$('pxBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-px-test]');
+  if (!b) return;
+  const i = Number(b.dataset.pxTest);
+  const row = pxRows[i];
+  if (!row) return;
+  const name = (row.name || '').trim();
+  if (!name) { toast('先给这条线路起个名字并保存，再测试', 'err'); return; }
+  b.disabled = true;
+  const old = b.textContent;
+  b.textContent = '测试中…';
+  try {
+    const r = await api('proxy/probe', { method: 'POST', body: JSON.stringify({ name }) });
+    if (r.ok) {
+      const where = r.exit_info ? '（' + r.exit_info + '）' : '';
+      toast('出口 ' + (r.exit_ip || '未知') + where + ' · ' + r.ms + 'ms', 'ok');
+      if (r.notice) toast(r.notice, 'warn');
+    } else {
+      toast('测试失败：' + (r.error || '未知原因'), 'err');
+    }
+  } catch (e) {
+    toast('测试失败：' + e.message, 'err');
+  } finally {
+    b.disabled = false;
+    b.textContent = old;
+  }
+});
+
+$('pxBody').addEventListener('input', ev => {
+  const inp = ev.target.closest('input[data-i]');
+  if (!inp) return;
+  const i = Number(inp.dataset.i);
+  if (!pxRows[i]) return;
+  if (inp.classList.contains('px-name')) pxRows[i].name = inp.value;
+  else pxRows[i].url = inp.value;
+});
+
+$('btnPxSave').onclick = async () => {
+  const b = $('btnPxSave');
+  const routes = {};
+  const seen = {};
+  for (const r of pxRows) {
+    const n = (r.name || '').trim();
+    if (!n) { toast('线路名不能为空', 'err'); return; }
+    if (seen[n]) { toast('线路名重复：' + n, 'err'); return; }
+    seen[n] = true;
+    if (!(r.url || '').trim()) { toast('线路 ' + n + ' 的地址为空', 'err'); return; }
+    routes[n] = r.url.trim();
+  }
+  b.disabled = true;
+  try {
+    await api('proxy/routes', { method: 'PUT', body: JSON.stringify({ routes }) });
+    toast('线路表已保存并生效', 'ok');
+    await loadProxyEditor();
+    loadOverview(true);
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally { b.disabled = false; }
+};
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -438,6 +625,7 @@ function renderAccounts(list) {
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
+      proxyCellHtml(s) +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -504,6 +692,9 @@ function renderModelLocks(rows) {
 
 async function loadOverview(quiet) {
   try {
+    // 线路表与账号列表一起刷新：账号行的出口下拉要用它填选项。
+    // 首次进入或刚改过线路表时都要重取，否则下拉会显示成「默认」。
+    await loadProxyRoutes();
     const d = await api('overview');
     overviewData = d;
     $('sTotal').textContent = d.total;
@@ -526,6 +717,7 @@ async function loadOverview(quiet) {
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
+    renderLoginSelect();
     renderModelLocks(d.model_locks);
     // 到期卡片跟随首页统计同步刷新（用同一份响应里的按日批次，不额外发请求）。
     // 2 分钟内的实时明细最新且更全，保留；过期后由 state 快照接管，避免点过一次
@@ -569,6 +761,25 @@ $('accBody').addEventListener('click', async ev => {
     }
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; loadOverview(true); }
+});
+
+// 账号「出口」下拉：改绑定即时生效（后端写 auths 文件 + 改池内同一指针）。
+$('accBody').addEventListener('change', async ev => {
+  const sel = ev.target.closest('select.pxy-sel');
+  if (!sel) return;
+  const u = sel.dataset.u, name = sel.value;
+  sel.disabled = true;
+  try {
+    await api('accounts/' + encodeURIComponent(u) + '/proxy', {
+      method: 'PUT', body: JSON.stringify({ proxy: name }),
+    });
+    toast(name ? ('出口已切换到 ' + (name === proxyState.direct ? '强制直连' : name)) : '出口已恢复默认', 'ok');
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    sel.disabled = false;
+    loadOverview(true);
+  }
 });
 
 $('btnCheckinAll').onclick = async () => {

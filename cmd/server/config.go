@@ -26,6 +26,23 @@ type Config struct {
 	// Android/magisk 模块里没有 /etc/resolv.conf，必须显式指定，否则解析全落本机 :53。
 	DNSServers []string `json:"dns_servers,omitempty"`
 
+	// LoginProxy 「添加账号」的登录流程走哪条线路（空 = 进程默认出口）。
+	//
+	// 登录时账号还不存在，拿不到账号绑定的线路，但 OAuth 握手与换 token 都是
+	// 真实打到腾讯域名的请求——不指定就是加号那一步从家网出口出去。
+	// 名字必须存在于 Proxies 里。
+	LoginProxy string `json:"login_proxy,omitempty"`
+
+	// Proxies 账号级出口线路表：线路名 → 代理地址（http / https / socks5 / socks5h）。
+	//
+	// 账号文件（auths/*.json 顶层 `proxy`）里存的是**线路名**，在这里解析成地址。
+	// 线路名查不到时明确报错、不静默直连（静默直连等于「以为隔离了其实没隔离」，
+	// 见 upstream.clientFor）。
+	//
+	// 与 workbuddy-manager 的「设置 → 代理」页同一份契约（都写这个段），
+	// 两边可以共用一份配置。
+	Proxies map[string]string `json:"proxies,omitempty"`
+
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`

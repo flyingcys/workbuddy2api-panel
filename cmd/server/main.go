@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -181,6 +182,44 @@ func main() {
 		}
 		log.Printf("DNS: 出站解析用 %v（不走系统 /etc/resolv.conf）", cfg.DNSServers)
 	}
+
+	// 账号级出口线路（见 docs/account-egress-plan.md）：
+	//   1) 先注入 Trip 构造器——线路 Transport 必须与共享 Transport 参数一致。
+	//      顺序要紧：本注入必须在上面「改共享 Transport 的 ResponseHeaderTimeout /
+	//      装 DNS dialer」**之后**，否则工厂闭包捕获到的是旧值。
+	//   2) 再载入线路表。
+	upstream.SetRouteTransportFactory(func() *http.Transport {
+		tr := upstream.NewRouteTransport()
+		// 与共享 Transport 保持同一口径：聊天首字节超时（main 已按 config 覆盖过
+		// 共享那份，这里用同样的值）。省略它会让绑线路的账号悄悄用 60s 默认值。
+		if up.HeaderTimeout > 0 {
+			tr.ResponseHeaderTimeout = up.HeaderTimeout
+		}
+		if len(cfg.DNSServers) > 0 {
+			// 独立 dialer 实例：与共享那份不必是同一对象，参数来自同一 func。
+			tr.DialContext = upstream.NewDNSDialer(cfg.DNSServers).DialContext
+		}
+		return tr
+	})
+	if err := upstream.ConfigureRoutes(cfg.Proxies); err != nil {
+		// 地址非法不阻断启动：线路表其余条目仍可用，绑到坏线路的账号会在
+		// 发请求时明确报错（不静默直连）。这里必须让人看见。
+		log.Printf("WARN: 出口线路表有问题：%v", err)
+	}
+	// 登录流程的出口（可选）：账号尚不存在，只能按配置里指定的线路走。
+	if cfg.LoginProxy != "" {
+		if err := panel.SetLoginProxy(cfg.LoginProxy); err != nil {
+			log.Printf("WARN: 登录线路 %q 不可用，登录流程回落默认出口：%v", cfg.LoginProxy, err)
+		} else {
+			log.Printf("登录线路：添加账号的 OAuth 流程走 %q", cfg.LoginProxy)
+		}
+	}
+	if names := upstream.RouteNames(); len(names) > 0 {
+		log.Printf("出口线路已加载：%d 条（%s）—— 账号绑定的线路名按它解析",
+			len(names), strings.Join(names, ", "))
+	} else {
+		log.Printf("未配置出口线路（config.json 的 proxies 段）：账号若绑了线路会明确报错，不会静默直连")
+	}
 	// model.json 本地缓存接线（context_length/max_output_tokens 四级查找链第 3 级）：
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
@@ -317,6 +356,11 @@ func main() {
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
+		// 「测试出口」的查询端点。出口检查服务各区域可达性差别很大，
+		// 某些网络下 ipinfo.io 不可达，可用 WB2A_PROBE_URL 换成自己的端点。
+		ProbeURL: os.Getenv("WB2A_PROBE_URL"),
+		// 登录线路回显（实际生效由上面的 SetLoginProxy 完成）。
+		LoginProxy: cfg.LoginProxy,
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
@@ -549,6 +593,21 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+
+	// 出口线路表热生效：换表 + 清缓存 + 丢弃按线路缓存的 client。
+	// 已绑定但新表里不存在的线路不会在这里报错——那些账号发请求时会明确失败
+	// （这是刻意的：保存配置时删除一条仍被使用的线路，不该让整个保存失败，
+	// 但必须让人看得见，所以错误仍返回给面板）。
+	if err := upstream.ConfigureRoutes(newCfg.Proxies); err != nil {
+		return append(restartRequiredFields(newCfg), "$proxies_warning"),
+			fmt.Errorf("出口线路表已保存，但存在无效条目：%w", err)
+	}
+	up.ResetRouteClients()
+	// 登录线路同样热生效；不合法时清空（回落默认出口）并告警，不阻断保存。
+	if err := panel.SetLoginProxy(newCfg.LoginProxy); err != nil {
+		log.Printf("WARN: 保存的登录线路 %q 不可用，登录流程回落默认出口：%v", newCfg.LoginProxy, err)
+		_ = panel.SetLoginProxy("")
+	}
 
 	return restartRequiredFields(newCfg), nil
 }

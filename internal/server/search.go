@@ -118,6 +118,13 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 			// 与 chat 复用同一错误策略：余额不足/限流/WAF/账号故障各自冷却或熔断，
 			// model 传空——搜索没有模型维度，不写模型级冷却。
 			h.applyErrorPolicy(acct.UID, ue.Kind, ue.Msg, "", ue)
+		} else if upstream.IsRouteUnavailable(serr) {
+			// 出口线路配置错误：不换号、不罚号（同 chat 路径的理由——换任何账号
+			// 都是同一条线路、同一个失败，喂连败只会把整池烧进熔断）。
+			lastStatus = http.StatusBadGateway
+			log.Printf("ERR: [server] 搜索出口线路配置错误 acct=%s: %v（不换号、不罚号）",
+				logfmt.Label(acct.UID, acct.Nickname), serr)
+			break
 		} else {
 			// 传输层故障（非上游业务返回）：只喂连败计数，不按业务错误罚。
 			h.cfg.Pool.NoteFailures(acct.UID)
