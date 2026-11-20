@@ -939,13 +939,17 @@ func (c *Client) do(acct *auth.Auth, req *http.Request, kind clientKind) (*http.
 		return nil, err
 	}
 	resp, err := client.Do(req)
-	if err == nil && resp != nil && resp.StatusCode == http.StatusProxyAuthRequired {
+	if err == nil && resp != nil && resp.StatusCode == http.StatusProxyAuthRequired &&
+		wentThroughProxy(client, req) {
 		// HTTP 代理 + **http** 目标 + 407：Go 不把它当错误，而是正常返回一个
 		// 407 响应（实测 2026-11-20）。不在这里拦，它会一路走到调用方的
 		// `status >= 400` 分支，被 Classify 成 ErrClient → 换号路径。
 		//
-		// 407 的语义是「代理要求认证」，只可能来自代理这一跳（上游不会发它），
-		// 所以与线路故障同构。
+		// **必须同时确认这次真的经代理出去**：407 是代理专用码，但「上游不该发」
+		// 不等于「不会发」——中间层、CDN、误配都能产生。绑 __direct__ 的账号
+		// 若撞上上游 407，按状态码一刀切会把它判成「线路故障 → 不换号」，
+		// 于是 407 变成终端错误、永不重试。判据从「看状态码」改成「看这次是否
+		// 真的经过了代理」。
 		resp.Body.Close()
 		if rerr := classifyRouteTransportErr(acct, errProxyAuthRequired); rerr != nil {
 			return nil, rerr
@@ -984,6 +988,22 @@ func classifyRouteTransportErr(acct *auth.Auth, err error) error {
 		Name:    name,
 		Err:     fmt.Errorf("连接代理失败：%s", proxyTransportReason(err)),
 	}
+}
+
+// wentThroughProxy 判断这次请求是否真的经过了代理。
+//
+// 用于把 407 归类为线路故障之前的确认：直接连（Proxy == nil，例如绑了
+// __direct__）响应里的 407 只可能来自上游或中间层，不该判成线路问题。
+func wentThroughProxy(client *http.Client, req *http.Request) bool {
+	if client == nil {
+		return false
+	}
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok || tr.Proxy == nil {
+		return false
+	}
+	u, err := tr.Proxy(req)
+	return err == nil && u != nil
 }
 
 // errProxyAuthRequired HTTP 代理要求认证（407）。用一个哨兵错误让上面的
@@ -1465,6 +1485,20 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			// 线路专属 Transport，清共享池对它的失败连接无效。
 			roundTripCloseIdle(chatClient.Transport)
 			return nil, 0, nil, err
+		}
+		if resp.StatusCode == http.StatusProxyAuthRequired && wentThroughProxy(chatClient, req) {
+			// 与 do() 同一判据：只在实际经代理时把 407 归为线路故障。
+			// 漏掉这一处时，聊天路径会把代理认证失败当成 ErrClient 罚号——
+			// 连败 5 次触发降权（实测）。
+			resp.Body.Close()
+			cancel()
+			rerr := classifyRouteTransportErr(a, errProxyAuthRequired)
+			if rerr == nil {
+				rerr = errProxyAuthRequired // 未绑线路：当作普通错误往上走
+			}
+			log.Printf("ERR: [upstream] chat_stream acct=%s: 出口线路故障: %v",
+				logfmt.Label(a.UID, a.Nickname), rerr)
+			return nil, 0, nil, rerr
 		}
 		if resp.StatusCode >= 400 {
 			raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

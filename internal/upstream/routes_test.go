@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -773,5 +774,55 @@ func TestChatPathClassifiesRouteFailure(t *testing.T) {
 	}
 	if !IsRouteUnavailable(err) {
 		t.Fatalf("聊天路径没有归类线路故障（会被当账号抖动换号罚号）：%T %v", err, err)
+	}
+}
+
+// ── C1/C2：407 只在「这次确实经代理」时才算线路故障 ──────────────────
+//
+// 同一个错误前提的两个方向：
+//
+//	C1 漏 —— 聊天路径没有 407 判断，代理认证失败被当 ErrClient 罚号；
+//	C2 过宽 —— 绑 __direct__（或无代理）时上游自己回 407，也会被判成线路故障，
+//	           于是 407 变成终端错误、永不重试。
+func TestProxyAuthOnlyCountsWhenProxied(t *testing.T) {
+	// 直连 client：上游自己回 407 → 不该算线路故障
+	direct := &http.Client{Transport: &http.Transport{}} // Proxy == nil
+	req, _ := http.NewRequest("GET", "http://up.example/", nil)
+	if wentThroughProxy(direct, req) {
+		t.Error("直连却判定为经代理")
+	}
+
+	// 经代理的 client → 算
+	u, _ := url.Parse("http://user:pass@proxy.example:8080")
+	proxied := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(u)}}
+	if !wentThroughProxy(proxied, req) {
+		t.Error("经代理却判定为直连")
+	}
+}
+
+// 绑定 __direct__ 的账号：上游 407 不得被归为线路故障。
+func TestDirectRouteDoesNotClassify407AsRouteFailure(t *testing.T) {
+	defer ResetRoutesForTest()
+	SetRouteTransportFactory(func() *http.Transport { return NewRouteTransport() })
+	t.Cleanup(func() { SetRouteTransportFactory(nil) })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusProxyAuthRequired)
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		HTTP:          &http.Client{Timeout: 5 * time.Second, Transport: NewRouteTransport()},
+		BillingBaseCN: srv.URL,
+	}
+	a := &auth.Auth{AccessToken: "at", UID: "u"}
+	a.SetProxyName(DirectRouteName)
+
+	err := c.ReportChatActivity(a, "conv", "")
+	if err == nil {
+		t.Fatal("407 应当作为错误返回")
+	}
+	if IsRouteUnavailable(err) {
+		t.Fatalf("直连时上游 407 被误判为线路故障（会导致永不重试）：%v", err)
 	}
 }
