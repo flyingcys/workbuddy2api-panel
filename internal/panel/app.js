@@ -341,6 +341,10 @@ $('btnKey').onclick = async () => {
   } catch (e) { $('keyErr').hidden = false; }
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+// 挡住 form 的默认提交：CSP 是 script-src 'self'，不能靠 HTML 里的
+// onsubmit="return false"（内联处理器会被拦并在控制台报错）。默认提交会让页面
+// 带着 GET 参数重新加载一次，看起来像"点了没反应又刷新"。
+$('keyForm').addEventListener('submit', e => e.preventDefault());
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 /* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份

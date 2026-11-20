@@ -1400,7 +1400,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
     </header>
     <div class="body">
-      <form style="display:contents" onsubmit="return false"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
+      <!-- 不能写 onsubmit="return false"：CSP 是 script-src 'self'，内联事件处理器会被
+           拦截并在控制台报错（2026-10-03 起回归）。回车提交由 app.js 的 keydown
+           监听处理，这里也不需要 form 的默认提交行为 —— 用 preventDefault 在
+           app.js 里挡（见 bindKeyForm）。 -->
+      <form style="display:contents" id="keyForm"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
       <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
     </div>
     <footer>
