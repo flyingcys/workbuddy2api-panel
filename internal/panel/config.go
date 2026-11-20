@@ -6,6 +6,7 @@
 package panel
 
 import (
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -25,7 +26,7 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"path":   p.cfg.ConfigPath,
-		"config": cfg,
+		"config": redactConfigProxies(cfg),
 	})
 }
 
@@ -54,4 +55,45 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 		"ok":               true,
 		"restart_required": restartRequired,
 	})
+}
+
+// redactConfigProxies 把配置里的代理密码打成 *** 再回给浏览器。
+//
+// 为什么必须在这里做：`GET /panel/api/config` 返回的是整个 Config 结构体，
+// 新增的 Proxies 段直接带着明文密码。而「凭据只进不出」是这个功能写在文件头的
+// 硬约束——线路页（/proxy/routes）做脱敏、配置页漏掉，等于绕过去了。
+//
+// 做法是走 JSON 中转再改一段：Config 的具体类型由 main 注入（any），
+// 这里不能直接断言字段。
+func redactConfigProxies(cfg any) any {
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return cfg
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return cfg
+	}
+	seg, ok := doc["proxies"]
+	if !ok {
+		return cfg
+	}
+	var table map[string]string
+	if err := json.Unmarshal(seg, &table); err != nil {
+		return cfg
+	}
+	for name, addr := range table {
+		masked, _ := maskProxyURL(addr)
+		table[name] = masked
+	}
+	redacted, err := json.Marshal(table)
+	if err != nil {
+		return cfg
+	}
+	doc["proxies"] = redacted
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return cfg
+	}
+	return json.RawMessage(out)
 }

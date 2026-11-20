@@ -562,6 +562,14 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
+	//
+	// 线路表先校验：它是**唯一会拒绝整次保存**的段（要么全生效、要么全不生效）。
+	// 放在 live.Store 之前，才是真正的「整次保存失败」——否则会出现
+	// 「api_key 等字段已生效、线路表没生效」的半成品状态。
+	if err := upstream.ConfigureRoutes(newCfg.Proxies); err != nil {
+		return append(restartRequiredFields(newCfg), "$proxies_rejected"),
+			fmt.Errorf("保存被拒（配置未改动）：出口线路表有无效条目：%w", err)
+	}
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
@@ -593,20 +601,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 
-	// 出口线路表热生效。
-	//
-	// ConfigureRoutes 是「要么全生效、要么全不生效」：有非法条目时一个都不应用，
-	// 表保持原样。所以这里出错**必须照样走完下面的清理**，不能直接 return ——
-	// 早先的写法直接 return 跳过了 ResetRouteClients，而当时 ConfigureRoutes 是
-	// 「先应用再报错」，结果是新表已生效、client 缓存还是旧的（旧地址继续服务）。
-	// 现在两个语义都改了，这条路径才是一致的：出错 = 什么都没变。
-	if err := upstream.ConfigureRoutes(newCfg.Proxies); err != nil {
-		log.Printf("WARN: 出口线路表未生效（存在无效条目，保持原表）：%v", err)
-		// 登录线路也保持原样，并明确告知保存被拒。
-		return append(restartRequiredFields(newCfg), "$proxies_rejected"),
-			fmt.Errorf("出口线路表未生效：%w", err)
-	}
 	// 换表后必须丢弃按线路缓存的 client（它们绑着旧 Transport）。
+	// （线路表本身已在上面校验并生效。）
 	up.ResetRouteClients()
 	// 登录线路同样热生效；它是独立的一份 client，换表后必须重建。
 	if err := panel.SetLoginProxy(newCfg.LoginProxy); err != nil {

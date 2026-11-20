@@ -885,9 +885,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 依次喂 NoteError，整池进冷却，而真实原因是线路配错。
 				if upstream.IsRouteUnavailable(err) {
 					st.status = http.StatusBadGateway
-					log.Printf("ERR: [server] refresh 出口线路配置错误 acct=%s: %v（不换号、不罚号）",
+					routeFailed = true
+					log.Printf("ERR: [server] refresh 出口线路配置错误 acct=%s: %v（该号不罚，继续试别的号）",
 						logfmt.Label(acct.UID, acct.Nickname), err)
-					break
+					// 与下面 ChatStreamContext 分支同一语义：线路按账号绑，坏的是
+					// 这个号那条线，别的号可能走另一条（或默认出口）。早先这里是
+					// break —— 同一种失败原因走不同路径给用户两种答案（refresh 前置
+					// 给 503「没有可用账号」，chat 主路径给 502 + 跳过），已对齐。
+					fail(acct.UID)
+					if !rotateBackoff(i, r.Context()) {
+						break
+					}
+					continue
 				}
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {

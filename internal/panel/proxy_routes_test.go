@@ -3,6 +3,7 @@ package panel
 import (
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -313,5 +314,92 @@ func TestMaskedRoundTripRestoresPassword(t *testing.T) {
 	}
 	if !strings.Contains(e.configText(t), "sekret") {
 		t.Fatalf("脱敏串回读后密码丢了：\n%s", e.configText(t))
+	}
+}
+
+// ── N2：保存含保留名的表，config.json 必须逐字节不变 ────────────────────
+//
+// 这条是 bug 驱动的：早先是「校验 → 落盘 → 热生效」，而拒绝保留名的检查在
+// 热生效那一步，于是文件已经被写过。下次启动整表不生效（ConfigureRoutes 是
+// 「要么全生效、要么全不生效」的），一次误操作把正常线路一起打掉。
+func TestRoutesSaveRejectedDoesNotTouchDisk(t *testing.T) {
+	e := newProxyTestEnv(t)
+	// 先存一条正常线路
+	if code, b := e.do(t, "PUT", "/panel/api/proxy/routes",
+		`{"routes":{"hk-1":"socks5://user:pass@h1.example:1080"}}`); code != 200 {
+		t.Fatalf("首次保存失败：%d %v", code, b)
+	}
+	before := e.configText(t)
+
+	// 再提交一张含保留名的表
+	code, _ := e.do(t, "PUT", "/panel/api/proxy/routes",
+		`{"routes":{"hk-1":"socks5://user:pass@h1.example:1080","`+upstream.DirectRouteName+`":"socks5://x:y@h:1"}}`)
+	if code != 400 {
+		t.Fatalf("含保留名的表应当 400，实际 %d", code)
+	}
+	if after := e.configText(t); after != before {
+		t.Fatalf("被拒绝的保存改动了 config.json：\n之前：%s\n之后：%s", before, after)
+	}
+	// 内存表也仍是原来那张
+	names := upstream.RouteNames()
+	if len(names) != 1 || names[0] != "hk-1" {
+		t.Fatalf("内存表被改动了：%v", names)
+	}
+}
+
+// 地址非法同样不得改动磁盘。
+func TestRoutesSaveInvalidAddressDoesNotTouchDisk(t *testing.T) {
+	e := newProxyTestEnv(t)
+	e.do(t, "PUT", "/panel/api/proxy/routes", `{"routes":{"hk-1":"socks5://user:pass@h1.example:1080"}}`)
+	before := e.configText(t)
+	code, _ := e.do(t, "PUT", "/panel/api/proxy/routes", `{"routes":{"bad":"socks4://h:1080"}}`)
+	if code != 400 {
+		t.Fatalf("非法地址应当 400，实际 %d", code)
+	}
+	if e.configText(t) != before {
+		t.Fatal("被拒绝的保存改动了 config.json")
+	}
+}
+
+// ── N4：删除登录线路后，loginHTTP 必须回落默认出口 ─────────────────────
+func TestLoginProxyFallsBackWhenRouteDeleted(t *testing.T) {
+	e := newProxyTestEnv(t)
+	e.do(t, "PUT", "/panel/api/proxy/routes", `{"routes":{"r1":"socks5://u:p@127.0.0.1:1111"}}`)
+
+	// 设登录线路
+	if err := SetLoginProxy("r1"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if LoginProxyName() != "r1" {
+		t.Fatalf("回显不对：%q", LoginProxyName())
+	}
+
+	// 删掉这条线路
+	code, body := e.do(t, "PUT", "/panel/api/proxy/routes", `{"routes":{}}`)
+	if code != 200 {
+		t.Fatalf("删除应当成功：%d %v", code, body)
+	}
+	// 登录 client 不能再指向已删除线路
+	tr, _ := loginClient().Transport.(*http.Transport)
+	if tr != nil && tr.Proxy != nil {
+		t.Fatalf("登录仍指向已删除的线路（fail-open）")
+	}
+	if LoginProxyName() != "" {
+		t.Fatalf("回显应当清空，实际 %q", LoginProxyName())
+	}
+}
+
+// ── N3：SetLoginProxy 失败不得写回显 ───────────────────────────────────
+func TestSetLoginProxyFailureKeepsEcho(t *testing.T) {
+	e := newProxyTestEnv(t)
+	e.do(t, "PUT", "/panel/api/proxy/routes", `{"routes":{"r1":"socks5://u:p@127.0.0.1:1111"}}`)
+	if err := SetLoginProxy("r1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetLoginProxy("no-such-route"); err == nil {
+		t.Fatal("不存在的线路应当报错")
+	}
+	if got := LoginProxyName(); got != "r1" {
+		t.Fatalf("失败时回显被改成了 %q（应保持 r1）", got)
 	}
 }

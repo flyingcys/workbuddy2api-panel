@@ -939,6 +939,19 @@ func (c *Client) do(acct *auth.Auth, req *http.Request, kind clientKind) (*http.
 		return nil, err
 	}
 	resp, err := client.Do(req)
+	if err == nil && resp != nil && resp.StatusCode == http.StatusProxyAuthRequired {
+		// HTTP 代理 + **http** 目标 + 407：Go 不把它当错误，而是正常返回一个
+		// 407 响应（实测 2026-11-20）。不在这里拦，它会一路走到调用方的
+		// `status >= 400` 分支，被 Classify 成 ErrClient → 换号路径。
+		//
+		// 407 的语义是「代理要求认证」，只可能来自代理这一跳（上游不会发它），
+		// 所以与线路故障同构。
+		resp.Body.Close()
+		if rerr := classifyRouteTransportErr(acct, errProxyAuthRequired); rerr != nil {
+			return nil, rerr
+		}
+		return nil, errProxyAuthRequired
+	}
 	if err != nil {
 		// 线路故障的**第二种形态**：线路名合法、地址格式也合法，但代理本身不可达
 		// （端口拒绝 / SOCKS 认证失败 / DNS 解析不了代理 / 超时）。
@@ -973,6 +986,10 @@ func classifyRouteTransportErr(acct *auth.Auth, err error) error {
 	}
 }
 
+// errProxyAuthRequired HTTP 代理要求认证（407）。用一个哨兵错误让上面的
+// classifyRouteTransportErr 能认出它（它按文本匹配 proxyconnect / socks connect）。
+var errProxyAuthRequired = errors.New("proxyconnect: Proxy Authentication Required")
+
 // isRouteTransportError 判断这个传输层错误是否来自「代理这一跳」而不是目标本身。
 //
 // 只认代理链的**确定性**特征：proxyconnect（HTTP 代理握手）/ socks connect
@@ -983,7 +1000,15 @@ func classifyRouteTransportErr(acct *auth.Auth, err error) error {
 // 让「上游慢」变成「线路配置错误」从而停止轮转。宁可漏判到抖动分支。
 func isRouteTransportError(err error) bool {
 	msg := err.Error()
-	return strings.Contains(msg, "proxyconnect") || strings.Contains(msg, "socks connect")
+	if strings.Contains(msg, "proxyconnect") || strings.Contains(msg, "socks connect") {
+		return true
+	}
+	// HTTP 代理 407：Go 在「https 目标」时把 407 变成一条不含 proxyconnect 的
+	// 普通错误。漏掉它就会掉进 Classify(407) → ErrClient → 换号路径。
+	if strings.Contains(msg, "Proxy Authentication Required") {
+		return true
+	}
+	return false
 }
 
 // proxyTransportReason 把代理链错误翻成一句可行动的说明（不泄漏地址）。

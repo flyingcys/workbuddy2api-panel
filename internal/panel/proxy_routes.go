@@ -120,6 +120,14 @@ func (p *Panel) routesSaveHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			v = merged
 		}
+		// 保留名：transportFor 对它走 transportDirect()，表里的地址会被静默忽略。
+		// 必须在**落盘之前**挡住 —— ConfigureRoutes 也会拒，但那时文件已经写过了，
+		// 一次误操作会把整张表（含正常线路）从「全部生效」打成「全部不生效」。
+		if n == upstream.DirectRouteName {
+			writeErr(w, http.StatusBadRequest,
+				fmt.Sprintf("%s 是保留名（表示「强制直连」），不能当作线路名", n))
+			return
+		}
 		norm, nerr := upstream.NormalizeProxyURLString(v)
 		if nerr != nil {
 			// 注意：这里的错误文本不含完整地址（NormalizeProxyURLString 保证）。
@@ -129,15 +137,21 @@ func (p *Panel) routesSaveHandler(w http.ResponseWriter, r *http.Request) {
 		next[n] = norm
 	}
 
-	if err := p.writeRouteTable(next); err != nil {
-		writeErr(w, http.StatusInternalServerError, "写入配置失败："+err.Error())
+	// **先试热生效，成功才落盘**。
+	//
+	// 反过来（先落盘再热生效）有个实测过的坏结果：ConfigureRoutes 拒绝时文件已经
+	// 写进去，下次启动整表不生效（它是「要么全生效、要么全不生效」的），而面板
+	// 返回 500 让人以为「保存失败了」。一次误操作就把正常线路一起打掉。
+	// 这个顺序下，任何拒绝都发生在文件被碰之前。
+	if err := upstream.ConfigureRoutes(next); err != nil {
+		writeErr(w, http.StatusBadRequest, "线路表未生效（配置未改动）："+err.Error())
 		return
 	}
-	// 立即热生效（写盘成功之后）。
-	if err := upstream.ConfigureRoutes(next); err != nil {
-		// 上面的校验已经挡掉非法地址，走到这里说明是并发/IO 异常；配置已落盘，
-		// 必须如实告知而不是假装成功。
-		writeErr(w, http.StatusInternalServerError, "线路表已写入，但热生效失败："+err.Error())
+	if err := p.writeRouteTable(next); err != nil {
+		// 热生效了但落盘失败：把内存表退回去，避免「本次运行生效、重启后还原」。
+		_ = upstream.ConfigureRoutes(old)
+		p.cfg.Upstream.ResetRouteClients()
+		writeErr(w, http.StatusInternalServerError, "写入配置失败（线路表已回滚）："+err.Error())
 		return
 	}
 	p.cfg.Upstream.ResetRouteClients()
@@ -145,10 +159,13 @@ func (p *Panel) routesSaveHandler(w http.ResponseWriter, r *http.Request) {
 	// 否则「在代理页删掉一条线路」之后，登录流程仍然从那条（已删除的）线路出去，
 	// 且发生在账号还不存在、无法用账号诊断的时刻。
 	if err := p.rebuildLoginProxy(); err != nil {
-		// 登录线路失效不该让整个保存失败（线路表已落盘并生效），但必须报出来。
+		// 登录线路失效不该让整个保存失败（线路表已落盘并生效），但**必须回落**：
+		// rebuildLoginProxy 失败时若不显式清空，loginHTTP 会继续用那条已删除线路的
+		// Transport —— 正是 I6 要防的「登录仍从已删除的线路出去」。
+		_ = SetLoginProxy("")
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "count": len(next),
-			"login_proxy_warning": err.Error(),
+			"login_proxy_warning": err.Error() + "（登录流程已回落默认出口）",
 		})
 		return
 	}

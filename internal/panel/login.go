@@ -69,26 +69,37 @@ var loginHTTPMu sync.RWMutex
 func SetLoginProxy(name string) error {
 	name = strings.TrimSpace(name)
 
-	// 记住当前值供面板回显。启动期注入的 Config.LoginProxy 是静态的，保存后
-	// 不更新会让前端每 5 秒轮询把下拉「跳回」旧值。
-	loginProxyMu.Lock()
-	loginProxyCur = name
-	loginProxyMu.Unlock()
-
 	if name == "" {
 		loginHTTPMu.Lock()
+		if old := loginHTTP.Transport; old != nil {
+			// 换 client 时关掉旧池：不然线路多 + 频繁改绑会短时堆住 fd。
+			if t, ok := old.(interface{ CloseIdleConnections() }); ok {
+				t.CloseIdleConnections()
+			}
+		}
 		loginHTTP = &http.Client{Timeout: 30 * time.Second}
 		loginHTTPMu.Unlock()
+		loginProxyMu.Lock()
+		loginProxyCur = ""
+		loginProxyMu.Unlock()
 		return nil
 	}
 
 	tr, err := upstream.TransportForRoute(name)
 	if err != nil {
+		// 失败时不改 loginProxyCur：否则面板会回显一条不存在的线路，而且
+		// rebuildLoginProxy 之后每次换表都会再失败一次并报 warning。
 		return err
 	}
 	loginHTTPMu.Lock()
 	loginHTTP = &http.Client{Timeout: 30 * time.Second, Transport: tr}
 	loginHTTPMu.Unlock()
+
+	// 记住当前值供面板回显（**只在成功后**）。启动期注入的 Config.LoginProxy
+	// 是静态的，保存后不更新会让前端每 5 秒轮询把下拉「跳回」旧值。
+	loginProxyMu.Lock()
+	loginProxyCur = name
+	loginProxyMu.Unlock()
 	return nil
 }
 

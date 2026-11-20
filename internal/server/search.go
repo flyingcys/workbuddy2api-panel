@@ -83,9 +83,14 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 				// 出口线路故障：不换号、不罚号（与 chat 的 refresh 分支同理由）。
 				if upstream.IsRouteUnavailable(rerr) {
 					lastStatus = http.StatusBadGateway
-					log.Printf("ERR: [server] 搜索 refresh 出口线路配置错误 acct=%s: %v（不换号、不罚号）",
+					lastErr = rerr
+					log.Printf("ERR: [server] 搜索 refresh 出口线路配置错误 acct=%s: %v（该号不罚，继续试别的号）",
 						logfmt.Label(acct.UID, acct.Nickname), rerr)
-					break
+					// 与 chat 同语义：跳过这个号继续轮转，而不是整池失败。
+					if !rotateBackoff(i, ctx) {
+						break
+					}
+					continue
 				}
 				var ue *upstream.Error
 				if errors.As(rerr, &ue) {
